@@ -7,19 +7,51 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Подключение к Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
+// Хелпер: получить пользователя из Bearer токена
+async function getUserFromToken(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace('Bearer ', '');
+  if (!token) return null;
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return data.user;
+}
+
+// ===== ENSURE USER (создать запись при первом входе) =====
+app.post('/api/ensure-user', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data: existing } = await supabase
+    .from('users')
+    .select('id')
+    .eq('id', authUser.id)
+    .single();
+
+  if (!existing) {
+    await supabase.from('users').insert({
+      id: authUser.id,
+      email: authUser.email,
+      credits: 100
+    });
+  }
+  res.json({ ok: true });
+});
+
 // ===== GET CREDITS =====
 app.get('/api/credits', async (req, res) => {
-  const userId = req.query.userId;
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
   const { data, error } = await supabase
     .from('users')
     .select('credits')
-    .eq('id', userId)
+    .eq('id', authUser.id)
     .single();
 
   if (error || !data) return res.status(404).json({ error: 'User not found' });
@@ -37,80 +69,79 @@ app.get('/api/samples', async (req, res) => {
   res.json(data);
 });
 
-// ===== DOWNLOAD (списывает 1 кредит) =====
+// ===== DOWNLOAD =====
 app.post('/api/download', async (req, res) => {
-  const { userId, sampleId } = req.body;
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { data: user, error: userErr } = await supabase
+  const { sampleId } = req.body;
+
+  const { data: user } = await supabase
     .from('users')
-    .select('id, credits')
-    .eq('id', userId)
+    .select('credits')
+    .eq('id', authUser.id)
     .single();
 
-  if (userErr || !user) return res.status(400).json({ error: 'Invalid user' });
+  if (!user) return res.status(400).json({ error: 'User not found' });
 
-  const { data: sample, error: sampleErr } = await supabase
+  const { data: sample } = await supabase
     .from('samples')
     .select('id, url')
     .eq('id', sampleId)
     .single();
 
-  if (sampleErr || !sample) return res.status(400).json({ error: 'Invalid sample' });
+  if (!sample) return res.status(400).json({ error: 'Sample not found' });
 
   const { data: existing } = await supabase
     .from('user_downloads')
     .select('id')
-    .eq('user_id', userId)
+    .eq('user_id', authUser.id)
     .eq('sample_id', sampleId)
     .single();
 
-  if (existing) {
-    return res.json({ url: sample.url });
-  }
+  if (existing) return res.json({ url: sample.url });
 
-  if (user.credits <= 0) {
-    return res.status(400).json({ error: 'No credits' });
-  }
+  if (user.credits <= 0) return res.status(400).json({ error: 'No credits' });
 
   await supabase
     .from('users')
     .update({ credits: user.credits - 1 })
-    .eq('id', userId);
+    .eq('id', authUser.id);
 
   await supabase
     .from('user_downloads')
-    .insert({ user_id: userId, sample_id: sampleId });
+    .insert({ user_id: authUser.id, sample_id: sampleId });
 
   res.json({ url: sample.url });
 });
 
 // ===== BUY CREDITS =====
 app.post('/api/buy', async (req, res) => {
-  const { userId, amount } = req.body;
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { data: user, error } = await supabase
+  const { amount } = req.body;
+
+  const { data: user } = await supabase
     .from('users')
     .select('credits')
-    .eq('id', userId)
+    .eq('id', authUser.id)
     .single();
 
-  if (error || !user) return res.status(404).json({ error: 'User not found' });
+  if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { data, error: updateErr } = await supabase
+  const { data } = await supabase
     .from('users')
     .update({ credits: user.credits + amount })
-    .eq('id', userId)
+    .eq('id', authUser.id)
     .select('credits')
     .single();
 
-  if (updateErr) return res.status(500).json({ error: updateErr.message });
   res.json({ success: true, credits: data.credits });
 });
 
 // ===== HEALTH CHECK =====
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Sample Store API running' });
-});
+app.get('/', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Сервер на порту ${PORT}`));
