@@ -6,8 +6,6 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
-
-// Вебхук читаем как raw body для проверки подписи
 app.use('/api/webhook/lemonsqueezy', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
@@ -16,14 +14,13 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-// Сколько кредитов даёт каждый вариант
-const CREDITS_MAP = {
-  [process.env.LS_VARIANT_STARTER]:   100,
-  [process.env.LS_VARIANT_PRO]:       350,
-  [process.env.LS_VARIANT_UNLIMITED]: 1000,
+// Кредиты за каждый план в месяц
+const PLAN_CREDITS = {
+  [process.env.LS_VARIANT_STARTER]:   { credits: 100,  plan: 'starter' },
+  [process.env.LS_VARIANT_PRO]:       { credits: 350,  plan: 'pro' },
+  [process.env.LS_VARIANT_UNLIMITED]: { credits: 1000, plan: 'unlimited' },
 };
 
-// Хелпер: получить пользователя из Bearer токена
 async function getUserFromToken(req) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   if (!token) return null;
@@ -36,55 +33,68 @@ async function getUserFromToken(req) {
 app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   const secret = process.env.LEMONSQUEEZY_SECRET;
   const signature = req.headers['x-signature'];
-  const body = req.body; // raw Buffer
+  const body = req.body;
 
-  // Проверяем подпись — защита от фейковых запросов
-  const hmac = crypto.createHmac('sha256', secret);
-  const digest = hmac.update(body).digest('hex');
-
+  const digest = crypto.createHmac('sha256', secret).update(body).digest('hex');
   if (signature !== digest) {
-    console.log('❌ Невалидная подпись вебхука');
+    console.log('Невалидная подпись вебхука');
     return res.status(401).json({ error: 'Invalid signature' });
   }
 
   const payload = JSON.parse(body.toString());
   const eventName = payload.meta?.event_name;
+  const attrs = payload.data?.attributes;
+  const variantId = String(attrs?.variant_id || attrs?.first_order_item?.variant_id || '');
+  const userEmail = attrs?.user_email;
+  const subscriptionId = String(payload.data?.id || '');
+  const renewsAt = attrs?.renews_at || attrs?.ends_at || null;
 
-  // Нас интересует только успешная оплата
-  if (eventName !== 'order_created') {
-    return res.json({ ok: true, skipped: true });
+  console.log(`Вебхук: ${eventName} | email: ${userEmail} | variant: ${variantId}`);
+
+  const planInfo = PLAN_CREDITS[variantId];
+
+  if (eventName === 'subscription_created' || eventName === 'subscription_renewed') {
+    if (!planInfo) {
+      console.log('Неизвестный variant_id:', variantId);
+      return res.json({ ok: true, skipped: true });
+    }
+
+    const { data: user } = await supabase
+      .from('users').select('id, credits').eq('email', userEmail).single();
+
+    if (!user) {
+      console.log('Пользователь не найден:', userEmail);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Rollover: добавляем к существующим кредитам
+    await supabase.from('users').update({
+      credits: user.credits + planInfo.credits,
+      plan: planInfo.plan,
+      subscription_id: subscriptionId,
+      renews_at: renewsAt,
+    }).eq('id', user.id);
+
+    console.log(`Начислено ${planInfo.credits} кредитов (rollover) для ${userEmail}`);
+    return res.json({ ok: true, credits_added: planInfo.credits });
   }
 
-  const order = payload.data?.attributes;
-  const variantId = String(order?.first_order_item?.variant_id);
-  const userEmail = order?.user_email;
-  const creditsToAdd = CREDITS_MAP[variantId];
+  if (eventName === 'subscription_cancelled' || eventName === 'subscription_expired') {
+    const { data: user } = await supabase
+      .from('users').select('id').eq('email', userEmail).single();
 
-  if (!creditsToAdd) {
-    console.log('⚠️ Неизвестный variant_id:', variantId);
-    return res.json({ ok: true, skipped: true });
+    if (user) {
+      await supabase.from('users').update({
+        plan: null,
+        subscription_id: null,
+        renews_at: null,
+      }).eq('id', user.id);
+      console.log(`Подписка отменена для ${userEmail}`);
+    }
+    return res.json({ ok: true });
   }
 
-  // Находим пользователя по email
-  const { data: user } = await supabase
-    .from('users')
-    .select('id, credits')
-    .eq('email', userEmail)
-    .single();
-
-  if (!user) {
-    console.log('⚠️ Пользователь не найден:', userEmail);
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  // Начисляем кредиты
-  await supabase
-    .from('users')
-    .update({ credits: user.credits + creditsToAdd })
-    .eq('id', user.id);
-
-  console.log(`✅ Начислено ${creditsToAdd} кредитов для ${userEmail}`);
-  res.json({ ok: true, credits_added: creditsToAdd });
+  res.json({ ok: true, skipped: true });
 });
 
 // ===== ENSURE USER =====
@@ -99,10 +109,26 @@ app.post('/api/ensure-user', async (req, res) => {
     await supabase.from('users').insert({
       id: authUser.id,
       email: authUser.email,
-      credits: 100
+      credits: 0,
+      plan: null,
     });
   }
   res.json({ ok: true });
+});
+
+// ===== GET PROFILE (кредиты + план + дата продления) =====
+app.get('/api/profile', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data } = await supabase
+    .from('users')
+    .select('credits, plan, renews_at, email')
+    .eq('id', authUser.id)
+    .single();
+
+  if (!data) return res.status(404).json({ error: 'User not found' });
+  res.json(data);
 });
 
 // ===== GET CREDITS =====
@@ -117,11 +143,26 @@ app.get('/api/credits', async (req, res) => {
   res.json({ credits: data.credits });
 });
 
+// ===== GET DOWNLOADS HISTORY =====
+app.get('/api/downloads', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data, error } = await supabase
+    .from('user_downloads')
+    .select('sample_id, downloaded_at, samples(title, url, instrument, bpm, key)')
+    .eq('user_id', authUser.id)
+    .order('downloaded_at', { ascending: false })
+    .limit(50);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
 // ===== GET SAMPLES =====
 app.get('/api/samples', async (req, res) => {
   const { data, error } = await supabase
     .from('samples').select('*').order('id', { ascending: true });
-
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -134,7 +175,7 @@ app.post('/api/download', async (req, res) => {
   const { sampleId } = req.body;
 
   const { data: user } = await supabase
-    .from('users').select('credits').eq('id', authUser.id).single();
+    .from('users').select('credits, plan').eq('id', authUser.id).single();
   if (!user) return res.status(400).json({ error: 'User not found' });
 
   const { data: sample } = await supabase
@@ -146,7 +187,10 @@ app.post('/api/download', async (req, res) => {
     .eq('user_id', authUser.id).eq('sample_id', sampleId).single();
 
   if (existing) return res.json({ url: sample.url });
-  if (user.credits <= 0) return res.status(400).json({ error: 'No credits' });
+
+  if (user.credits <= 0) {
+    return res.status(400).json({ error: 'No credits' });
+  }
 
   await supabase.from('users')
     .update({ credits: user.credits - 1 }).eq('id', authUser.id);
@@ -156,25 +200,8 @@ app.post('/api/download', async (req, res) => {
   res.json({ url: sample.url });
 });
 
-// ===== BUY CREDITS (прямо, без Lemon Squeezy — для теста) =====
-app.post('/api/buy', async (req, res) => {
-  const authUser = await getUserFromToken(req);
-  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
-
-  const { amount } = req.body;
-  const { data: user } = await supabase
-    .from('users').select('credits').eq('id', authUser.id).single();
-  if (!user) return res.status(404).json({ error: 'User not found' });
-
-  const { data } = await supabase
-    .from('users').update({ credits: user.credits + amount })
-    .eq('id', authUser.id).select('credits').single();
-
-  res.json({ success: true, credits: data.credits });
-});
-
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Сервер на порту ${PORT}`));
+app.listen(PORT, () => console.log(`Сервер на порту ${PORT}`));
