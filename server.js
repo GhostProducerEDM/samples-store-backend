@@ -205,3 +205,46 @@ app.get('/', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Сервер на порту ${PORT}`));
+
+// ===== LIKES =====
+app.get('/api/likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data, error } = await supabase
+    .from('user_likes')
+    .select('sample_id, liked_at, samples(title, url, instrument, bpm, key)')
+    .eq('user_id', authUser.id)
+    .order('liked_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post('/api/likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { sampleId } = req.body;
+  const { error } = await supabase
+    .from('user_likes')
+    .upsert({ user_id: authUser.id, sample_id: sampleId }, { onConflict: 'user_id,sample_id' });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.delete('/api/likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { sampleId } = req.body;
+  const { error } = await supabase
+    .from('user_likes')
+    .delete()
+    .eq('user_id', authUser.id)
+    .eq('sample_id', sampleId);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
