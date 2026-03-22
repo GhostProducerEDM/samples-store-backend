@@ -125,55 +125,59 @@ app.get('/api/credits', async (req, res) => {
   res.json({ credits: data.credits });
 });
 
-// ===== GET SAMPLES — батчами по 1000, без лимита =====
+// ===== GET SAMPLES — с фильтрацией и поиском на сервере =====
 app.get('/api/samples', async (req, res) => {
-  try {
-    let allData = [];
-    let from = 0;
-    const BATCH = 1000;
+  const {
+    search,       // текст поиска
+    instrument,   // фильтр инструмент
+    genre,        // фильтр жанр
+    type,         // Loop / One Shot
+    key,          // тональность
+    bpm_min,      // BPM от
+    bpm_max,      // BPM до
+    mood,         // настроение
+    artist_style, // стиль артиста
+    pack,         // пак
+    limit = 500,  // лимит (плеер грузит всё, фильтрует сам)
+    offset = 0,
+  } = req.query;
 
-    while (true) {
-      let query = supabase
-        .from('samples')
-        .select('id, title, url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags')
-        .order('id', { ascending: true })
-        .range(from, from + BATCH - 1);
+  let query = supabase
+    .from('samples')
+    .select('id, title, url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags')
+    .order('id', { ascending: true })
+    .range(Number(offset), Number(offset) + Number(limit) - 1);
 
-      const { data, error } = await query;
-      if (error) return res.status(500).json({ error: error.message });
-      if (!data || data.length === 0) break;
-
-      allData = allData.concat(data);
-      if (data.length < BATCH) break;
-      from += BATCH;
-    }
-
-    console.log(`Served ${allData.length} samples`);
-    res.json(allData);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  // Полнотекстовый поиск по названию и паку
+  if (search && search.trim()) {
+    query = query.or(`title.ilike.%${search}%,pack.ilike.%${search}%`);
   }
+
+  // Фильтры
+  if (instrument) query = query.ilike('instrument', `%${instrument}%`);
+  if (type)       query = query.eq('type', type);
+  if (key)        query = query.ilike('key', `%${key}%`);
+  if (pack)       query = query.ilike('pack', `%${pack}%`);
+  if (bpm_min)    query = query.gte('bpm', Number(bpm_min));
+  if (bpm_max)    query = query.lte('bpm', Number(bpm_max));
+
+  // Массивы — поиск contains
+  if (genre)        query = query.contains('genre', [genre]);
+  if (mood)         query = query.contains('mood', [mood]);
+  if (artist_style) query = query.contains('artist_style', [artist_style]);
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
 });
 
-// ===== GET FILTER OPTIONS =====
+// ===== GET FILTER OPTIONS — уникальные значения для дропдаунов =====
 app.get('/api/filters', async (req, res) => {
-  // Fetch all for filter building — also in batches
-  let allData = [];
-  let from = 0;
-  const BATCH = 1000;
+  const { data, error } = await supabase
+    .from('samples')
+    .select('instrument, genre, type, key, mood, artist_style, subgenre, pack');
 
-  while (true) {
-    const { data, error } = await supabase
-      .from('samples')
-      .select('instrument, genre, type, key, mood, artist_style, subgenre, pack')
-      .range(from, from + BATCH - 1);
-
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data || data.length === 0) break;
-    allData = allData.concat(data);
-    if (data.length < BATCH) break;
-    from += BATCH;
-  }
+  if (error) return res.status(500).json({ error: error.message });
 
   const unique = (arr, key, isArray = false) => {
     const set = new Set();
@@ -188,14 +192,14 @@ app.get('/api/filters', async (req, res) => {
   };
 
   res.json({
-    instruments:   unique(allData, 'instrument'),
-    genres:        unique(allData, 'genre', true),
-    types:         unique(allData, 'type'),
-    keys:          unique(allData, 'key'),
-    moods:         unique(allData, 'mood', true),
-    artist_styles: unique(allData, 'artist_style', true),
-    subgenres:     unique(allData, 'subgenre'),
-    packs:         unique(allData, 'pack'),
+    instruments:    unique(data, 'instrument'),
+    genres:         unique(data, 'genre', true),
+    types:          unique(data, 'type'),
+    keys:           unique(data, 'key'),
+    moods:          unique(data, 'mood', true),
+    artist_styles:  unique(data, 'artist_style', true),
+    subgenres:      unique(data, 'subgenre'),
+    packs:          unique(data, 'pack'),
   });
 });
 
@@ -305,8 +309,29 @@ app.delete('/api/likes', async (req, res) => {
   res.json({ ok: true });
 });
 
+
+// ===== RECORD PLAY =====
+app.post('/api/plays', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  const { sampleId } = req.body;
+  if (!sampleId) return res.status(400).json({ error: 'sampleId required' });
+
+  // Works for both logged in and anonymous users
+  if (authUser) {
+    await supabase.from('user_plays').insert({
+      user_id: authUser.id,
+      sample_id: sampleId,
+    });
+  }
+
+  // Increment play counter on sample (optional but useful for sorting)
+  await supabase.rpc('increment_play_count', { sample_id: sampleId }).catch(() => {});
+
+  res.json({ ok: true });
+});
+
 // ===== HEALTH CHECK =====
-app.get('/', (req, res) => res.json({ status: 'ok', version: '2.1', note: 'batch loading enabled' }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '2.0' }));
 
 // ===== START =====
 const PORT = process.env.PORT || 3000;
