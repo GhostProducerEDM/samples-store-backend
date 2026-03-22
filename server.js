@@ -203,9 +203,6 @@ app.post('/api/download', async (req, res) => {
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => res.json({ status: 'ok' }));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Сервер на порту ${PORT}`));
-
 // ===== LIKES =====
 app.get('/api/likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
@@ -248,3 +245,7 @@ app.delete('/api/likes', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
+
+// ===== START SERVER =====
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
