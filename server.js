@@ -28,6 +28,22 @@ async function getUserFromToken(req) {
   return data.user;
 }
 
+// Fetch ALL rows from a table/query in batches of 1000 (Supabase hard limit per request)
+async function fetchAll(buildQuery) {
+  let all = [];
+  let from = 0;
+  const BATCH = 1000;
+  while (true) {
+    const { data, error } = await buildQuery(from, from + BATCH - 1);
+    if (error) return { data: null, error };
+    if (!data || data.length === 0) break;
+    all = all.concat(data);
+    if (data.length < BATCH) break;
+    from += BATCH;
+  }
+  return { data: all, error: null };
+}
+
 // ===== WEBHOOK Lemon Squeezy =====
 app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   const secret = process.env.LEMONSQUEEZY_SECRET;
@@ -125,82 +141,62 @@ app.get('/api/credits', async (req, res) => {
   res.json({ credits: data.credits });
 });
 
-// ===== GET SAMPLES — с фильтрацией и поиском на сервере =====
+// ===== GET SAMPLES — no limits, batch fetch all =====
 app.get('/api/samples', async (req, res) => {
-  const {
-    search,       // текст поиска
-    instrument,   // фильтр инструмент
-    genre,        // фильтр жанр
-    type,         // Loop / One Shot
-    key,          // тональность
-    bpm_min,      // BPM от
-    bpm_max,      // BPM до
-    mood,         // настроение
-    artist_style, // стиль артиста
-    pack,         // пак
-    limit = 500,  // лимит (плеер грузит всё, фильтрует сам)
-    offset = 0,
-  } = req.query;
+  try {
+    const { data, error } = await fetchAll((from, to) =>
+      supabase
+        .from('samples')
+        .select('id, title, url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count')
+        .order('id', { ascending: true })
+        .range(from, to)
+    );
 
-  let query = supabase
-    .from('samples')
-    .select('id, title, url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags')
-    .order('id', { ascending: true })
-    .range(Number(offset), Number(offset) + Number(limit) - 1);
-
-  // Полнотекстовый поиск по названию и паку
-  if (search && search.trim()) {
-    query = query.or(`title.ilike.%${search}%,pack.ilike.%${search}%`);
+    if (error) return res.status(500).json({ error: error.message });
+    console.log(`Served ${data.length} samples`);
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  // Фильтры
-  if (instrument) query = query.ilike('instrument', `%${instrument}%`);
-  if (type)       query = query.eq('type', type);
-  if (key)        query = query.ilike('key', `%${key}%`);
-  if (pack)       query = query.ilike('pack', `%${pack}%`);
-  if (bpm_min)    query = query.gte('bpm', Number(bpm_min));
-  if (bpm_max)    query = query.lte('bpm', Number(bpm_max));
-
-  // Массивы — поиск contains
-  if (genre)        query = query.contains('genre', [genre]);
-  if (mood)         query = query.contains('mood', [mood]);
-  if (artist_style) query = query.contains('artist_style', [artist_style]);
-
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
 });
 
-// ===== GET FILTER OPTIONS — уникальные значения для дропдаунов =====
+// ===== GET FILTER OPTIONS — no limits =====
 app.get('/api/filters', async (req, res) => {
-  const { data, error } = await supabase
-    .from('samples')
-    .select('instrument, genre, type, key, mood, artist_style, subgenre, pack');
+  try {
+    const { data, error } = await fetchAll((from, to) =>
+      supabase
+        .from('samples')
+        .select('instrument, genre, type, key, mood, artist_style, subgenre, pack')
+        .range(from, to)
+    );
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: error.message });
 
-  const unique = (arr, key, isArray = false) => {
-    const set = new Set();
-    arr.forEach(item => {
-      if (isArray && Array.isArray(item[key])) {
-        item[key].forEach(v => v && set.add(v));
-      } else if (item[key]) {
-        set.add(item[key]);
-      }
+    const unique = (arr, key, isArray = false) => {
+      const set = new Set();
+      arr.forEach(item => {
+        if (isArray && Array.isArray(item[key])) {
+          item[key].forEach(v => v && set.add(v));
+        } else if (item[key]) {
+          set.add(item[key]);
+        }
+      });
+      return [...set].sort();
+    };
+
+    res.json({
+      instruments:   unique(data, 'instrument'),
+      genres:        unique(data, 'genre', true),
+      types:         unique(data, 'type'),
+      keys:          unique(data, 'key'),
+      moods:         unique(data, 'mood', true),
+      artist_styles: unique(data, 'artist_style', true),
+      subgenres:     unique(data, 'subgenre'),
+      packs:         unique(data, 'pack'),
     });
-    return [...set].sort();
-  };
-
-  res.json({
-    instruments:    unique(data, 'instrument'),
-    genres:         unique(data, 'genre', true),
-    types:          unique(data, 'type'),
-    keys:           unique(data, 'key'),
-    moods:          unique(data, 'mood', true),
-    artist_styles:  unique(data, 'artist_style', true),
-    subgenres:      unique(data, 'subgenre'),
-    packs:          unique(data, 'pack'),
-  });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== DOWNLOAD =====
@@ -242,8 +238,7 @@ app.get('/api/downloads', async (req, res) => {
     .from('user_downloads')
     .select('sample_id, downloaded_at, samples(title, url, instrument, bpm, key, cover)')
     .eq('user_id', authUser.id)
-    .order('downloaded_at', { ascending: false })
-    .limit(100);
+    .order('downloaded_at', { ascending: false });
 
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -309,14 +304,12 @@ app.delete('/api/likes', async (req, res) => {
   res.json({ ok: true });
 });
 
-
 // ===== RECORD PLAY =====
 app.post('/api/plays', async (req, res) => {
   const authUser = await getUserFromToken(req);
   const { sampleId } = req.body;
   if (!sampleId) return res.status(400).json({ error: 'sampleId required' });
 
-  // Works for both logged in and anonymous users
   if (authUser) {
     await supabase.from('user_plays').insert({
       user_id: authUser.id,
@@ -324,14 +317,12 @@ app.post('/api/plays', async (req, res) => {
     });
   }
 
-  // Increment play counter on sample (optional but useful for sorting)
   await supabase.rpc('increment_play_count', { sample_id: sampleId }).catch(() => {});
-
   res.json({ ok: true });
 });
 
 // ===== HEALTH CHECK =====
-app.get('/', (req, res) => res.json({ status: 'ok', version: '2.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '3.0', note: 'no limits — batch fetch all' }));
 
 // ===== START =====
 const PORT = process.env.PORT || 3000;
