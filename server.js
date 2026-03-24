@@ -310,45 +310,6 @@ app.post('/api/plays', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ===== GET PACKS with covers (for player strip) =====
-app.get('/api/packs', async (req, res) => {
-  try {
-    // Get one representative sample per pack (with cover, genre, bpm)
-    const { data, error } = await supabase
-      .from('samples')
-      .select('pack, cover, genre, bpm')
-      .not('pack', 'is', null);
-
-    if (error) return res.status(500).json({ error: error.message });
-
-    // Group by pack — pick most common cover + first genre/bpm
-    const packMap = {};
-    (data || []).forEach(s => {
-      if (!s.pack) return;
-      if (!packMap[s.pack]) {
-        packMap[s.pack] = { name: s.pack, cover: null, genre: null, bpm: null, count: 0, coverCounts: {} };
-      }
-      const p = packMap[s.pack];
-      p.count++;
-      if (s.cover) p.coverCounts[s.cover] = (p.coverCounts[s.cover] || 0) + 1;
-      if (!p.genre && s.genre && s.genre.length) p.genre = Array.isArray(s.genre) ? s.genre[0] : s.genre;
-      if (!p.bpm && s.bpm) p.bpm = s.bpm;
-    });
-
-    // Pick most common cover per pack
-    const packs = Object.values(packMap).map(p => {
-      const entries = Object.entries(p.coverCounts);
-      if (entries.length) p.cover = entries.sort((a,b) => b[1]-a[1])[0][0];
-      delete p.coverCounts;
-      return p;
-    }).sort((a, b) => b.count - a.count); // most populated packs first
-
-    res.json(packs);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => res.json({ status: 'ok', version: '4.0', note: 'server-side pagination' }));
 
