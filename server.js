@@ -209,7 +209,10 @@ app.get('/api/samples', async (req, res) => {
     if (bpm_max)    query = query.lte('bpm', Number(bpm_max));
     if (genre)      query = query.contains('genre', [genre]);
     if (mood)       query = query.contains('mood', [mood]);
-    if (artist_style) query = query.contains('artist_style', [artist_style]);
+    if (artist_style) {
+      const a = String(artist_style).trim();
+      query = query.contains('artist_style', [a]);
+    }
 
     // Sorting
     if (sort === 'popular') {
@@ -254,7 +257,7 @@ app.get('/api/filters', async (req, res) => {
   try {
     const { data, error } = await fetchAll((from, to) =>
       supabase.from('samples')
-        .select('instrument, genre, type, key, mood, artist_style, subgenre, pack')
+        .select('instrument, genre, type, key, mood, artist_style, subgenre, pack, cover')
         .range(from, to)
     );
     if (error) return res.status(500).json({ error: error.message });
@@ -268,15 +271,76 @@ app.get('/api/filters', async (req, res) => {
       return [...set].sort();
     };
 
+    const countScalar = (rows, key) => {
+      const c = {};
+      rows.forEach((row) => {
+        const v = row[key];
+        if (v == null || v === '') return;
+        c[v] = (c[v] || 0) + 1;
+      });
+      return c;
+    };
+
+    const countArrayField = (rows, key) => {
+      const c = {};
+      rows.forEach((row) => {
+        const val = row[key];
+        if (Array.isArray(val)) {
+          val.forEach((v) => {
+            if (!v) return;
+            c[v] = (c[v] || 0) + 1;
+          });
+        } else if (val != null && val !== '') {
+          c[val] = (c[val] || 0) + 1;
+        }
+      });
+      return c;
+    };
+
+    const uniqueArtistStyles = (rows) => {
+      const set = new Set();
+      rows.forEach((item) => {
+        const v = item.artist_style;
+        if (Array.isArray(v)) v.forEach((x) => x && set.add(x));
+        else if (v) set.add(v);
+      });
+      return [...set].sort((a, b) => a.localeCompare(b));
+    };
+
+    const packMap = {};
+    (data || []).forEach((s) => {
+      if (!s.pack) return;
+      if (!packMap[s.pack]) packMap[s.pack] = { _cc: {} };
+      if (s.cover) {
+        packMap[s.pack]._cc[s.cover] = (packMap[s.pack]._cc[s.cover] || 0) + 1;
+      }
+    });
+    const pack_covers = {};
+    Object.entries(packMap).forEach(([name, p]) => {
+      const entries = Object.entries(p._cc);
+      if (entries.length) pack_covers[name] = entries.sort((a, b) => b[1] - a[1])[0][0];
+    });
+
+    const packCounts = countScalar(data, 'pack');
+    const packsByPopularity = Object.entries(packCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name]) => name);
+
+    const instrument_counts = countScalar(data, 'instrument');
+    const artist_style_counts = countArrayField(data, 'artist_style');
+
     res.json({
       instruments:   unique(data, 'instrument'),
       genres:        unique(data, 'genre', true),
       types:         unique(data, 'type'),
       keys:          unique(data, 'key'),
       moods:         unique(data, 'mood', true),
-      artist_styles: unique(data, 'artist_style', true),
+      artist_styles: uniqueArtistStyles(data),
       subgenres:     unique(data, 'subgenre'),
-      packs:         unique(data, 'pack'),
+      packs:         packsByPopularity.length ? packsByPopularity : unique(data, 'pack'),
+      pack_covers,
+      instrument_counts,
+      artist_style_counts,
     });
   } catch(e) {
     res.status(500).json({ error: e.message });
