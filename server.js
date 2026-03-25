@@ -80,6 +80,61 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
     if (user) await supabase.from('users').update({ plan: null, subscription_id: null, renews_at: null }).eq('id', user.id);
     return res.json({ ok: true });
   }
+  // ===== PACK PURCHASE (one-time order) =====
+  if (eventName === 'order_created') {
+    const orderAttrs = payload.data?.attributes;
+    const orderEmail = orderAttrs?.user_email;
+    const orderItems = orderAttrs?.first_order_item || {};
+    const orderVariantId = String(orderItems?.variant_id || '');
+    const orderId = String(payload.data?.id || '');
+
+    console.log(`Pack order: ${orderId} | ${orderEmail} | variant: ${orderVariantId}`);
+
+    // Find pack product by variant_id
+    const { data: packProduct } = await supabase
+      .from('pack_products')
+      .select('pack_name, bonus_credits')
+      .eq('ls_variant_id', orderVariantId)
+      .single();
+
+    if (!packProduct) {
+      console.log('No pack product found for variant:', orderVariantId);
+      return res.json({ ok: true, skipped: true });
+    }
+
+    // Find user by email
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, credits')
+      .eq('email', orderEmail)
+      .single();
+
+    if (!user) {
+      console.log('User not found for pack purchase:', orderEmail);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Record pack purchase (ignore duplicate)
+    await supabase
+      .from('user_packs')
+      .upsert({
+        user_id: user.id,
+        pack_name: packProduct.pack_name,
+        ls_order_id: orderId,
+      }, { onConflict: 'user_id,pack_name' });
+
+    // Add bonus credits
+    if (packProduct.bonus_credits > 0) {
+      await supabase
+        .from('users')
+        .update({ credits: user.credits + packProduct.bonus_credits })
+        .eq('id', user.id);
+    }
+
+    console.log(`Pack "${packProduct.pack_name}" granted to ${orderEmail} + ${packProduct.bonus_credits} bonus credits`);
+    return res.json({ ok: true, pack: packProduct.pack_name, bonus_credits: packProduct.bonus_credits });
+  }
+
   res.json({ ok: true, skipped: true });
 });
 
@@ -308,6 +363,85 @@ app.post('/api/plays', async (req, res) => {
   if (authUser) await supabase.from('user_plays').insert({ user_id: authUser.id, sample_id: sampleId });
   await supabase.rpc('increment_play_count', { sample_id: sampleId }).catch(() => {});
   res.json({ ok: true });
+});
+
+// ===== PACK PRODUCTS — список паков для продажи =====
+app.get('/api/pack-products', async (req, res) => {
+  const { data, error } = await supabase
+    .from('pack_products')
+    .select('pack_name, price_usd, bonus_credits, ls_variant_id');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ===== PACK ACCESS — купил ли пользователь пак =====
+app.get('/api/pack-access', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  const { pack } = req.query;
+  if (!pack) return res.status(400).json({ error: 'pack required' });
+
+  // Not logged in — no access
+  if (!authUser) return res.json({ access: false });
+
+  const { data } = await supabase
+    .from('user_packs')
+    .select('id, purchased_at')
+    .eq('user_id', authUser.id)
+    .eq('pack_name', pack)
+    .single();
+
+  res.json({ access: !!data, purchased_at: data?.purchased_at || null });
+});
+
+// ===== USER PACKS — все купленные паки пользователя =====
+app.get('/api/user-packs', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data, error } = await supabase
+    .from('user_packs')
+    .select('pack_name, purchased_at')
+    .eq('user_id', authUser.id)
+    .order('purchased_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ===== PACKS with covers (for player strip) =====
+app.get('/api/packs', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('samples')
+      .select('pack, cover, genre, bpm')
+      .not('pack', 'is', null);
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    const packMap = {};
+    (data || []).forEach(s => {
+      if (!s.pack) return;
+      if (!packMap[s.pack]) {
+        packMap[s.pack] = { name: s.pack, cover: null, genre: null, bpm: null, count: 0, _cc: {} };
+      }
+      const p = packMap[s.pack];
+      p.count++;
+      if (s.cover) p._cc[s.cover] = (p._cc[s.cover] || 0) + 1;
+      if (!p.genre && s.genre) p.genre = Array.isArray(s.genre) ? s.genre[0] : s.genre;
+      if (!p.bpm && s.bpm) p.bpm = s.bpm;
+    });
+
+    const packs = Object.values(packMap).map(p => {
+      const entries = Object.entries(p._cc);
+      if (entries.length) p.cover = entries.sort((a,b) => b[1]-a[1])[0][0];
+      delete p._cc;
+      return p;
+    }).sort((a, b) => b.count - a.count);
+
+    res.json(packs);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== HEALTH CHECK =====
