@@ -557,6 +557,36 @@ app.get('/api/pack-download', async (req, res) => {
   res.json({ url: zipUrl });
 });
 
+// ===== PAYMENT HISTORY =====
+app.get('/api/payment-history', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data: packs, error } = await supabase
+    .from('user_packs')
+    .select('pack_name, purchased_at, ls_order_id')
+    .eq('user_id', authUser.id)
+    .order('purchased_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const { data: products } = await supabase
+    .from('pack_products')
+    .select('pack_name, price_usd');
+
+  const priceMap = {};
+  (products || []).forEach(p => { priceMap[p.pack_name] = p.price_usd; });
+
+  const result = (packs || []).map(p => ({
+    type: 'pack',
+    description: p.pack_name,
+    date: p.purchased_at,
+    amount: priceMap[p.pack_name] ?? null,
+    order_id: p.ls_order_id || null,
+  }));
+
+  res.json(result);
+});
+
 // ===== USER PACKS — все купленные паки пользователя =====
 app.get('/api/user-packs', async (req, res) => {
   const authUser = await getUserFromToken(req);
