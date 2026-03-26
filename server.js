@@ -28,6 +28,17 @@ async function getUserFromToken(req) {
   return data.user;
 }
 
+// Creates a supabase client authenticated as the user (so RLS auth.uid() resolves correctly)
+async function userClient(req) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const client = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+  });
+  // setSession makes the client's auth interceptor use the user's JWT on every DB call
+  await client.auth.setSession({ access_token: token, refresh_token: token });
+  return client;
+}
+
 async function fetchAll(buildQuery) {
   let all = [];
   let from = 0;
@@ -380,7 +391,7 @@ app.get('/api/downloads', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { data, error } = await supabase.from('user_downloads')
-    .select('sample_id, downloaded_at, samples(title, url, instrument, bpm, key, cover)')
+    .select('sample_id, downloaded_at, samples(title, url, instrument, bpm, key, cover, pack)')
     .eq('user_id', authUser.id).order('downloaded_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -403,7 +414,7 @@ app.get('/api/likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { data, error } = await supabase.from('user_likes')
-    .select('sample_id, liked_at, samples(title, url, instrument, bpm, key, cover)')
+    .select('sample_id, liked_at, samples(title, url, instrument, bpm, key, cover, pack)')
     .eq('user_id', authUser.id).order('liked_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -433,9 +444,9 @@ app.delete('/api/likes', async (req, res) => {
 app.get('/api/pack-likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
-  const { data, error } = await supabase.from('user_pack_likes')
+  const uc = await userClient(req);
+  const { data, error } = await uc.from('user_pack_likes')
     .select('pack_name, liked_at')
-    .eq('user_id', authUser.id)
     .order('liked_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -446,7 +457,8 @@ app.post('/api/pack-likes', async (req, res) => {
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { packName } = req.body;
   if (!packName) return res.status(400).json({ error: 'packName required' });
-  const { error } = await supabase.from('user_pack_likes')
+  const uc = await userClient(req);
+  const { error } = await uc.from('user_pack_likes')
     .upsert({ user_id: authUser.id, pack_name: packName }, { onConflict: 'user_id,pack_name' });
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
@@ -456,8 +468,9 @@ app.delete('/api/pack-likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { packName } = req.body;
-  const { error } = await supabase.from('user_pack_likes')
-    .delete().eq('user_id', authUser.id).eq('pack_name', packName);
+  const uc = await userClient(req);
+  const { error } = await uc.from('user_pack_likes')
+    .delete().eq('pack_name', packName);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
@@ -498,6 +511,30 @@ app.get('/api/pack-access', async (req, res) => {
     .single();
 
   res.json({ access: !!data, purchased_at: data?.purchased_at || null });
+});
+
+// ===== PACK ZIP DOWNLOAD — Bunny.net =====
+app.get('/api/pack-download', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { pack } = req.query;
+  if (!pack) return res.status(400).json({ error: 'pack required' });
+
+  // Check user has purchased this pack
+  const { data: access } = await supabase
+    .from('user_packs')
+    .select('id')
+    .eq('user_id', authUser.id)
+    .eq('pack_name', pack)
+    .single();
+
+  if (!access) return res.status(403).json({ error: 'No access to this pack' });
+
+  const cdnBase = process.env.BUNNY_CDN_URL || 'https://gpe-samples-store-pl.b-cdn.net';
+  const zipUrl = `${cdnBase}/Packs/${encodeURIComponent(pack)}.zip`;
+
+  res.json({ url: zipUrl });
 });
 
 // ===== USER PACKS — все купленные паки пользователя =====
