@@ -221,6 +221,10 @@ app.get('/api/samples', async (req, res) => {
       query = query.order('bpm', { ascending: true });
     } else if (sort === 'bpm_desc') {
       query = query.order('bpm', { ascending: false });
+    } else if (sort === 'duration_asc') {
+      query = query.order('duration', { ascending: true });
+    } else if (sort === 'duration_desc') {
+      query = query.order('duration', { ascending: false });
     } else {
       // Default: random via id ordering with modulo trick
       // Use seed for consistent pagination
@@ -255,12 +259,18 @@ app.get('/api/samples/count', async (req, res) => {
 // ===== GET FILTER OPTIONS — cached, fetches all for dropdowns =====
 app.get('/api/filters', async (req, res) => {
   try {
-    const { data, error } = await fetchAll((from, to) =>
+    const genreParam = req.query.genre || null;
+    const { data: allData, error } = await fetchAll((from, to) =>
       supabase.from('samples')
         .select('instrument, genre, type, key, mood, artist_style, subgenre, pack, cover')
         .range(from, to)
     );
     if (error) return res.status(500).json({ error: error.message });
+    // Filter by genre if requested
+    const data = genreParam ? allData.filter(s => {
+      if (Array.isArray(s.genre)) return s.genre.includes(genreParam);
+      return s.genre === genreParam;
+    }) : allData;
 
     const unique = (arr, key, isArray = false) => {
       const set = new Set();
