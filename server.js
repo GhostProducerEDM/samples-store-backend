@@ -429,6 +429,39 @@ app.delete('/api/likes', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== PACK LIKES =====
+app.get('/api/pack-likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const { data, error } = await supabase.from('user_pack_likes')
+    .select('pack_name, liked_at')
+    .eq('user_id', authUser.id)
+    .order('liked_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post('/api/pack-likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const { packName } = req.body;
+  if (!packName) return res.status(400).json({ error: 'packName required' });
+  const { error } = await supabase.from('user_pack_likes')
+    .upsert({ user_id: authUser.id, pack_name: packName }, { onConflict: 'user_id,pack_name' });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.delete('/api/pack-likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const { packName } = req.body;
+  const { error } = await supabase.from('user_pack_likes')
+    .delete().eq('user_id', authUser.id).eq('pack_name', packName);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
 // ===== RECORD PLAY =====
 app.post('/api/plays', async (req, res) => {
   const authUser = await getUserFromToken(req);
