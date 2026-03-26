@@ -19,6 +19,7 @@ const PLAN_CREDITS = {
   [process.env.LS_VARIANT_PRO]:       { credits: 350,  plan: 'pro' },
   [process.env.LS_VARIANT_UNLIMITED]: { credits: 1000, plan: 'unlimited' },
 };
+const PLAN_PRICES = { starter: 9.99, pro: 19.99, unlimited: 29.99 };
 
 async function getUserFromToken(req) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
@@ -83,6 +84,12 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
       subscription_id: subscriptionId,
       renews_at: renewsAt,
     }).eq('id', user.id);
+    // Record subscription payment in history
+    await supabase.from('subscriptions').insert({
+      user_id: user.id,
+      plan: planInfo.plan,
+      credits_added: planInfo.credits,
+    });
     console.log(`+${planInfo.credits} credits → ${userEmail}`);
     return res.json({ ok: true, credits_added: planInfo.credits });
   }
@@ -562,27 +569,33 @@ app.get('/api/payment-history', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { data: packs, error } = await supabase
-    .from('user_packs')
-    .select('pack_name, purchased_at, ls_order_id')
-    .eq('user_id', authUser.id)
-    .order('purchased_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-
-  const { data: products } = await supabase
-    .from('pack_products')
-    .select('pack_name, price_usd');
+  const [{ data: packs }, { data: subs }, { data: products }] = await Promise.all([
+    supabase.from('user_packs').select('pack_name, purchased_at, ls_order_id')
+      .eq('user_id', authUser.id).order('purchased_at', { ascending: false }),
+    supabase.from('subscriptions').select('plan, credits_added, created_at')
+      .eq('user_id', authUser.id).order('created_at', { ascending: false }),
+    supabase.from('pack_products').select('pack_name, price_usd'),
+  ]);
 
   const priceMap = {};
   (products || []).forEach(p => { priceMap[p.pack_name] = p.price_usd; });
 
-  const result = (packs || []).map(p => ({
+  const packItems = (packs || []).map(p => ({
     type: 'pack',
     description: p.pack_name,
     date: p.purchased_at,
     amount: priceMap[p.pack_name] ?? null,
-    order_id: p.ls_order_id || null,
   }));
+
+  const subItems = (subs || []).map(s => ({
+    type: 'subscription',
+    description: `${s.plan.charAt(0).toUpperCase() + s.plan.slice(1)} plan — ${s.credits_added} credits`,
+    date: s.created_at,
+    amount: PLAN_PRICES[s.plan?.toLowerCase()] ?? null,
+  }));
+
+  const result = [...packItems, ...subItems]
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
 
   res.json(result);
 });
