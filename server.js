@@ -485,6 +485,26 @@ app.post('/api/plays', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== PACK COVERS — most-common cover URL per pack =====
+app.get('/api/pack-covers', async (req, res) => {
+  const { data, error } = await supabase
+    .from('samples')
+    .select('pack, cover')
+    .not('pack', 'is', null)
+    .not('cover', 'is', null);
+  if (error) return res.status(500).json({ error: error.message });
+  const cc = {};
+  (data || []).forEach(({ pack, cover }) => {
+    if (!cc[pack]) cc[pack] = {};
+    cc[pack][cover] = (cc[pack][cover] || 0) + 1;
+  });
+  const result = {};
+  Object.entries(cc).forEach(([pack, counts]) => {
+    result[pack] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+  });
+  res.json(result);
+});
+
 // ===== PACK PRODUCTS — список паков для продажи =====
 app.get('/api/pack-products', async (req, res) => {
   const { data, error } = await supabase
