@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/pack/:slug", "destination": "/pack" }
+  ]
+}
