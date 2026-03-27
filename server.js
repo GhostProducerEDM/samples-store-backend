@@ -211,11 +211,14 @@ app.get('/api/samples', async (req, res) => {
 
     let query = supabase
       .from('samples')
-      .select('id, title, url, preview_url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count', { count: 'exact' });
+      .select('id, title, preview_url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count', { count: 'exact' });
 
-    // Text search
+    // Text search — title, pack, instrument (partial) + genre, mood, artist_style (array contains)
     if (search?.trim()) {
-      query = query.or(`title.ilike.%${search}%,pack.ilike.%${search}%`);
+      const s = search.trim();
+      query = query.or(
+        `title.ilike.%${s}%,pack.ilike.%${s}%,instrument.ilike.%${s}%,genre.cs.{${s}},mood.cs.{${s}},artist_style.cs.{${s}}`
+      );
     }
 
     // Filters
@@ -262,6 +265,39 @@ app.get('/api/samples', async (req, res) => {
       limit: limitNum,
       pages: Math.ceil((count || 0) / limitNum),
     });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== STREAM — secure redirect to audio file (auth required) =====
+app.get('/api/stream/:id', async (req, res) => {
+  try {
+    const user = await getUserFromToken(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: sample, error } = await supabase
+      .from('samples')
+      .select('url')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !sample?.url) return res.status(404).json({ error: 'Not found' });
+
+    // Optional: Bunny.net token-signed URL (set BUNNY_TOKEN_KEY in .env)
+    if (process.env.BUNNY_TOKEN_KEY && sample.url.includes('b-cdn.net')) {
+      const expiry = Math.floor(Date.now() / 1000) + 3600;
+      const urlObj = new URL(sample.url);
+      const token = crypto.createHmac('sha256', process.env.BUNNY_TOKEN_KEY)
+        .update(process.env.BUNNY_TOKEN_KEY + urlObj.pathname + expiry)
+        .digest('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+      urlObj.searchParams.set('token', token);
+      urlObj.searchParams.set('expires', String(expiry));
+      return res.redirect(302, urlObj.toString());
+    }
+
+    res.redirect(302, sample.url);
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -398,7 +434,7 @@ app.get('/api/downloads', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { data, error } = await supabase.from('user_downloads')
-    .select('sample_id, downloaded_at, samples(title, url, instrument, bpm, key, cover, pack)')
+    .select('sample_id, downloaded_at, samples(title, preview_url, instrument, bpm, key, cover, pack)')
     .eq('user_id', authUser.id).order('downloaded_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -421,7 +457,7 @@ app.get('/api/likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { data, error } = await supabase.from('user_likes')
-    .select('sample_id, liked_at, samples(title, url, instrument, bpm, key, cover, pack)')
+    .select('sample_id, liked_at, samples(title, preview_url, instrument, bpm, key, cover, pack)')
     .eq('user_id', authUser.id).order('liked_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -488,7 +524,7 @@ app.post('/api/plays', async (req, res) => {
   const { sampleId } = req.body;
   if (!sampleId) return res.status(400).json({ error: 'sampleId required' });
   if (authUser) await supabase.from('user_plays').insert({ user_id: authUser.id, sample_id: sampleId });
-  await supabase.rpc('increment_play_count', { sample_id: sampleId }).catch(() => {});
+  try { await supabase.rpc('increment_play_count', { sample_id: sampleId }); } catch(e) {}
   res.json({ ok: true });
 });
 
