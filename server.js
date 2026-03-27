@@ -552,9 +552,27 @@ app.get('/api/pack-covers', async (req, res) => {
 app.get('/api/pack-products', async (req, res) => {
   const { data, error } = await supabase
     .from('pack_products')
-    .select('pack_name, price_usd, bonus_credits, ls_variant_id');
+    .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
+});
+
+// POST /api/admin/pack-products — upsert a pack product entry (admin only)
+app.post('/api/admin/pack-products', requireAdmin, async (req, res) => {
+  try {
+    const { pack_name, ls_variant_id, price_usd, bonus_credits, download_url } = req.body;
+    if (!pack_name || !ls_variant_id) return res.status(400).json({ error: 'pack_name and ls_variant_id required' });
+    const { error } = await supabase.from('pack_products').upsert({
+      pack_name, ls_variant_id: String(ls_variant_id),
+      price_usd: price_usd || null,
+      bonus_credits: bonus_credits || 0,
+      download_url: download_url || null,
+    }, { onConflict: 'pack_name' });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== PACK ACCESS — купил ли пользователь пак =====
@@ -594,10 +612,17 @@ app.get('/api/pack-download', async (req, res) => {
 
   if (!access) return res.status(403).json({ error: 'No access to this pack' });
 
-  const cdnBase = process.env.BUNNY_CDN_URL || 'https://gpe-samples-store-pl.b-cdn.net';
-  const zipUrl = `${cdnBase}/Packs/${encodeURIComponent(pack)}.zip`;
+  // Use custom download_url from pack_products if set, otherwise build CDN path
+  const { data: product } = await supabase
+    .from('pack_products')
+    .select('download_url')
+    .eq('pack_name', pack)
+    .single();
 
-  res.json({ url: zipUrl });
+  const cdnBase = process.env.BUNNY_CDN_URL || 'https://gpe-samples-store-pl.b-cdn.net';
+  const url = product?.download_url || `${cdnBase}/Packs/${encodeURIComponent(pack)}.zip`;
+
+  res.json({ url });
 });
 
 // ===== PAYMENT HISTORY =====
@@ -689,6 +714,295 @@ app.get('/api/packs', async (req, res) => {
 
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => res.json({ status: 'ok', version: '4.0', note: 'server-side pagination' }));
+
+// ═══════════════════════════════════════════
+// ADMIN API — protected by X-Admin-Key header
+// ═══════════════════════════════════════════
+const ADMIN_KEY = process.env.ADMIN_KEY || 'admin_gpe_2024';
+
+function requireAdmin(req, res, next) {
+  if (req.headers['x-admin-key'] !== ADMIN_KEY) {
+    return res.status(403).json({ error: 'Forbidden — invalid admin key' });
+  }
+  next();
+}
+
+// GET /api/admin/stats — dashboard numbers
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const [samplesR, usersR, downloadsR, purchasesR, likesR, subsR] = await Promise.all([
+      supabase.from('samples').select('id', { count: 'exact', head: true }),
+      supabase.from('users').select('id', { count: 'exact', head: true }),
+      supabase.from('user_downloads').select('id', { count: 'exact', head: true }),
+      supabase.from('user_packs').select('id', { count: 'exact', head: true }),
+      supabase.from('user_likes').select('id', { count: 'exact', head: true }),
+      supabase.from('subscriptions').select('plan, credits_added'),
+    ]);
+    // Compute revenue from subscriptions
+    const PRICES = { starter: 9.99, pro: 19.99, unlimited: 29.99 };
+    let revenue = 0;
+    (subsR.data || []).forEach(s => { revenue += PRICES[s.plan?.toLowerCase()] || 0; });
+    res.json({
+      total_samples: samplesR.count || 0,
+      total_users: usersR.count || 0,
+      total_downloads: downloadsR.count || 0,
+      total_purchases: purchasesR.count || 0,
+      total_likes: likesR.count || 0,
+      total_revenue: revenue,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/users?page=1&limit=30&search=
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 30, search } = req.query;
+    const lim = Math.min(100, Math.max(1, parseInt(limit)));
+    const from = (Math.max(1, parseInt(page)) - 1) * lim;
+    const to = from + lim - 1;
+    let q = supabase.from('users')
+      .select('id, email, credits, plan, renews_at, created_at', { count: 'exact' });
+    if (search) q = q.ilike('email', `%${search}%`);
+    q = q.order('created_at', { ascending: false }).range(from, to);
+    const { data, count, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ users: data || [], total: count || 0, page: parseInt(page), pages: Math.ceil((count || 0) / lim) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/users/:id/credits — adjust user credits (amount can be negative)
+app.post('/api/admin/users/:id/credits', requireAdmin, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    if (typeof amount !== 'number') return res.status(400).json({ error: 'amount must be number' });
+    const { data: user } = await supabase.from('users').select('credits').eq('id', req.params.id).single();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const newCredits = Math.max(0, user.credits + amount);
+    const { error } = await supabase.from('users').update({ credits: newCredits }).eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, new_credits: newCredits });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/users/:id/plan — change user plan
+app.put('/api/admin/users/:id/plan', requireAdmin, async (req, res) => {
+  try {
+    const { plan } = req.body;
+    const { error } = await supabase.from('users').update({ plan: plan || null }).eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/samples — admin view with url field + more details
+app.get('/api/admin/samples', requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 30, search, instrument, genre, pack, sort } = req.query;
+    const lim = Math.min(100, Math.max(1, parseInt(limit)));
+    const from = (Math.max(1, parseInt(page)) - 1) * lim;
+    const to = from + lim - 1;
+    let q = supabase.from('samples')
+      .select('id, title, pack, instrument, bpm, key, genre, type, mood, artist_style, preview_url, url, play_count, cover', { count: 'exact' });
+    if (search) q = q.or(`title.ilike.%${search}%,pack.ilike.%${search}%`);
+    if (instrument) q = q.ilike('instrument', `%${instrument}%`);
+    if (pack) q = q.ilike('pack', `%${pack}%`);
+    if (genre) q = q.contains('genre', [genre]);
+    if (sort === 'bpm_asc') q = q.order('bpm', { ascending: true });
+    else if (sort === 'bpm_desc') q = q.order('bpm', { ascending: false });
+    else if (sort === 'plays') q = q.order('play_count', { ascending: false });
+    else q = q.order('id', { ascending: true });
+    q = q.range(from, to);
+    const { data, count, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ samples: data || [], total: count || 0, pages: Math.ceil((count || 0) / lim) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/samples/:id — inline edit
+app.put('/api/admin/samples/:id', requireAdmin, async (req, res) => {
+  try {
+    const allowed = ['title', 'pack', 'instrument', 'bpm', 'key', 'type', 'preview_url', 'url', 'cover'];
+    const update = {};
+    allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+    const { error } = await supabase.from('samples').update(update).eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/admin/samples/:id
+app.delete('/api/admin/samples/:id', requireAdmin, async (req, res) => {
+  try {
+    // Remove related records first
+    await supabase.from('user_downloads').delete().eq('sample_id', req.params.id);
+    await supabase.from('user_likes').delete().eq('sample_id', req.params.id);
+    await supabase.from('user_plays').delete().eq('sample_id', req.params.id);
+    const { error } = await supabase.from('samples').delete().eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/downloads?page=1&limit=30
+app.get('/api/admin/downloads', requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 30 } = req.query;
+    const lim = Math.min(100, Math.max(1, parseInt(limit)));
+    const from = (Math.max(1, parseInt(page)) - 1) * lim;
+    const to = from + lim - 1;
+    const { data, count, error } = await supabase.from('user_downloads')
+      .select('id, user_id, sample_id, downloaded_at, users(email), samples(title, pack, instrument)', { count: 'exact' })
+      .order('downloaded_at', { ascending: false })
+      .range(from, to);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ downloads: data || [], total: count || 0, pages: Math.ceil((count || 0) / lim) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/purchases?page=1&limit=30
+app.get('/api/admin/purchases', requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 30 } = req.query;
+    const lim = Math.min(100, Math.max(1, parseInt(limit)));
+    const from = (Math.max(1, parseInt(page)) - 1) * lim;
+    const to = from + lim - 1;
+    const { data: packs, count: packCount, error: packErr } = await supabase.from('user_packs')
+      .select('user_id, pack_name, purchased_at, ls_order_id, users(email)', { count: 'exact' })
+      .order('purchased_at', { ascending: false })
+      .range(from, to);
+    if (packErr) return res.status(500).json({ error: packErr.message });
+
+    const { data: products } = await supabase.from('pack_products').select('pack_name, price_usd');
+    const priceMap = {};
+    (products || []).forEach(p => { priceMap[p.pack_name] = p.price_usd; });
+
+    const items = (packs || []).map(p => ({
+      ...p,
+      price_usd: priceMap[p.pack_name] || null,
+    }));
+    res.json({ purchases: items, total: packCount || 0, pages: Math.ceil((packCount || 0) / lim) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/subscriptions
+app.get('/api/admin/subscriptions', requireAdmin, async (req, res) => {
+  try {
+    const { data, count, error } = await supabase.from('subscriptions')
+      .select('user_id, plan, credits_added, created_at, users(email)', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) return res.status(500).json({ error: error.message });
+    const PRICES = { starter: 9.99, pro: 19.99, unlimited: 29.99 };
+    const items = (data || []).map(s => ({ ...s, price_usd: PRICES[s.plan?.toLowerCase()] || null }));
+    res.json({ subscriptions: items, total: count || 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/tools/audit-previews
+app.post('/api/admin/tools/audit-previews', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await fetchAll((from, to) =>
+      supabase.from('samples').select('id, title, preview_url').range(from, to)
+    );
+    if (error) return res.status(500).json({ error: error.message });
+    const missing = (data || []).filter(s => !s.preview_url);
+    res.json({
+      total: data.length,
+      ok: data.length - missing.length,
+      missing_count: missing.length,
+      missing: missing.slice(0, 50).map(s => ({ id: s.id, title: s.title })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/tools/metadata-check
+app.post('/api/admin/tools/metadata-check', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await fetchAll((from, to) =>
+      supabase.from('samples').select('id, title, bpm, key, instrument, genre').range(from, to)
+    );
+    if (error) return res.status(500).json({ error: error.message });
+    const noBpm = (data || []).filter(s => !s.bpm).length;
+    const noKey = (data || []).filter(s => !s.key).length;
+    const noInst = (data || []).filter(s => !s.instrument).length;
+    const noGenre = (data || []).filter(s => !s.genre || (Array.isArray(s.genre) && !s.genre.length)).length;
+    res.json({ total: data.length, no_bpm: noBpm, no_key: noKey, no_instrument: noInst, no_genre: noGenre });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/tools/find-duplicates
+app.post('/api/admin/tools/find-duplicates', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await fetchAll((from, to) =>
+      supabase.from('samples').select('id, title').range(from, to)
+    );
+    if (error) return res.status(500).json({ error: error.message });
+    const counts = {};
+    (data || []).forEach(s => { counts[s.title] = (counts[s.title] || 0) + 1; });
+    const dupes = Object.entries(counts)
+      .filter(([, n]) => n > 1)
+      .sort((a, b) => b[1] - a[1])
+      .map(([title, count]) => ({ title, count }));
+    res.json({ total: data.length, duplicate_groups: dupes.length, items: dupes.slice(0, 50) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/tools/fix-covers — normalize cover URLs per pack
+app.post('/api/admin/tools/fix-covers', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await fetchAll((from, to) =>
+      supabase.from('samples').select('id, pack, cover').range(from, to)
+    );
+    if (error) return res.status(500).json({ error: error.message });
+    // Find most common cover per pack
+    const packCovers = {};
+    (data || []).forEach(s => {
+      if (!s.pack || !s.cover) return;
+      if (!packCovers[s.pack]) packCovers[s.pack] = {};
+      packCovers[s.pack][s.cover] = (packCovers[s.pack][s.cover] || 0) + 1;
+    });
+    const canonical = {};
+    Object.entries(packCovers).forEach(([pack, covers]) => {
+      canonical[pack] = Object.entries(covers).sort((a, b) => b[1] - a[1])[0][0];
+    });
+    // Count how many need fixing
+    const needsFix = (data || []).filter(s => s.pack && canonical[s.pack] && s.cover !== canonical[s.pack]);
+    res.json({
+      packs_analyzed: Object.keys(canonical).length,
+      samples_needing_fix: needsFix.length,
+      note: 'Run with apply=true to apply fixes',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ===== START =====
 const PORT = process.env.PORT || 3000;
