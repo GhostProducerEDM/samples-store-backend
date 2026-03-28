@@ -561,18 +561,11 @@ app.get('/api/pack-covers', async (req, res) => {
 
 // ===== PACK PRODUCTS — список паков для продажи =====
 app.get('/api/pack-products', async (req, res) => {
-  // Try full select with new columns; fall back to basic if columns don't exist yet
-  let { data, error } = await supabase
+  const { data, error } = await supabase
     .from('pack_products')
-    .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url, producer, featured, created_at')
+    .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url, producer, featured, created_at, cover_url')
     .order('created_at', { ascending: false });
-  if (error) {
-    // Columns may not exist yet — fall back to base columns
-    ({ data, error } = await supabase
-      .from('pack_products')
-      .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url'));
-    if (error) return res.status(500).json({ error: error.message });
-  }
+  if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
 
