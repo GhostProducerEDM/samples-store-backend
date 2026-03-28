@@ -5,7 +5,27 @@ const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
+
+const ALLOWED_ORIGINS = [
+  'http://localhost:3001',
+  'http://localhost:3000',
+  'https://billowing-waterfall-2c1f.yourghostproduceredm.workers.dev',
+  'https://yourghostproduceredm.workers.dev',
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // allow requests with no origin (curl, Postman, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    // allow any subdomain of yourghostproduceredm.workers.dev or pages.dev
+    if (/\.yourghostproduceredm\.workers\.dev$/.test(origin)) return callback(null, true);
+    if (/\.pages\.dev$/.test(origin)) return callback(null, true);
+    callback(new Error('CORS: origin not allowed — ' + origin));
+  },
+  credentials: true,
+}));
+
 app.use('/api/webhook/lemonsqueezy', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
@@ -552,23 +572,34 @@ app.get('/api/pack-covers', async (req, res) => {
 
 // ===== PACK PRODUCTS — список паков для продажи =====
 app.get('/api/pack-products', async (req, res) => {
-  const { data, error } = await supabase
+  // Try full select with new columns; fall back to basic if columns don't exist yet
+  let { data, error } = await supabase
     .from('pack_products')
-    .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url');
-  if (error) return res.status(500).json({ error: error.message });
+    .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url, producer, featured, created_at')
+    .order('created_at', { ascending: false });
+  if (error) {
+    // Columns may not exist yet — fall back to base columns
+    ({ data, error } = await supabase
+      .from('pack_products')
+      .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url'));
+    if (error) return res.status(500).json({ error: error.message });
+  }
   res.json(data || []);
 });
 
 // POST /api/admin/pack-products — upsert a pack product entry (admin only)
 app.post('/api/admin/pack-products', requireAdmin, async (req, res) => {
   try {
-    const { pack_name, ls_variant_id, price_usd, bonus_credits, download_url } = req.body;
-    if (!pack_name || !ls_variant_id) return res.status(400).json({ error: 'pack_name and ls_variant_id required' });
+    const { pack_name, ls_variant_id, price_usd, bonus_credits, download_url, producer, featured } = req.body;
+    if (!pack_name) return res.status(400).json({ error: 'pack_name required' });
     const { error } = await supabase.from('pack_products').upsert({
-      pack_name, ls_variant_id: String(ls_variant_id),
-      price_usd: price_usd || null,
+      pack_name,
+      ls_variant_id: ls_variant_id ? String(ls_variant_id) : '0',
+      price_usd: price_usd ?? null,
       bonus_credits: bonus_credits || 0,
       download_url: download_url || null,
+      producer: producer || 'GPE',
+      featured: featured ?? false,
     }, { onConflict: 'pack_name' });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ ok: true });
