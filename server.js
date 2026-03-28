@@ -539,6 +539,29 @@ app.post('/api/plays', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== PACK STATS — plays + downloads per pack =====
+app.get('/api/pack-stats', async (req, res) => {
+  try {
+    const [samplesRes, downloadsRes] = await Promise.all([
+      supabase.from('samples').select('pack, play_count').not('pack', 'is', null),
+      supabase.from('user_downloads').select('samples(pack)'),
+    ]);
+    const plays = {}, downloads = {};
+    (samplesRes.data || []).forEach(s => {
+      if (!s.pack) return;
+      plays[s.pack] = (plays[s.pack] || 0) + (s.play_count || 0);
+    });
+    (downloadsRes.data || []).forEach(d => {
+      const pack = d.samples?.pack;
+      if (pack) downloads[pack] = (downloads[pack] || 0) + 1;
+    });
+    const packs = new Set([...Object.keys(plays), ...Object.keys(downloads)]);
+    const result = {};
+    packs.forEach(p => { result[p] = { plays: plays[p] || 0, downloads: downloads[p] || 0 }; });
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ===== PACK COVERS — most-common cover URL per pack =====
 app.get('/api/pack-covers', async (req, res) => {
   const { data, error } = await supabase
