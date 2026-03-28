@@ -6,25 +6,14 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-const ALLOWED_ORIGINS = [
-  'http://localhost:3001',
-  'http://localhost:3000',
-  'https://billowing-waterfall-2c1f.yourghostproduceredm.workers.dev',
-  'https://yourghostproduceredm.workers.dev',
-];
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // allow requests with no origin (curl, Postman, server-to-server)
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    // allow any subdomain of yourghostproduceredm.workers.dev or pages.dev
-    if (/\.yourghostproduceredm\.workers\.dev$/.test(origin)) return callback(null, true);
-    if (/\.pages\.dev$/.test(origin)) return callback(null, true);
-    callback(new Error('CORS: origin not allowed — ' + origin));
-  },
-  credentials: true,
-}));
+// Allow all origins — auth is handled via Bearer token, not cookies
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
 app.use('/api/webhook/lemonsqueezy', express.raw({ type: 'application/json' }));
 app.use(express.json());
