@@ -466,7 +466,8 @@ app.get('/api/likes', async (req, res) => {
 app.post('/api/likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
-  const { sampleId } = req.body;
+  const sampleId = req.body.sampleId ?? req.body.sample_id;
+  if (!sampleId) return res.status(400).json({ error: 'sampleId required' });
   const { error } = await supabase.from('user_likes')
     .upsert({ user_id: authUser.id, sample_id: sampleId }, { onConflict: 'user_id,sample_id' });
   if (error) return res.status(500).json({ error: error.message });
@@ -476,7 +477,8 @@ app.post('/api/likes', async (req, res) => {
 app.delete('/api/likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
-  const { sampleId } = req.body;
+  const sampleId = req.body.sampleId ?? req.body.sample_id;
+  if (!sampleId) return res.status(400).json({ error: 'sampleId required' });
   const { error } = await supabase.from('user_likes')
     .delete().eq('user_id', authUser.id).eq('sample_id', sampleId);
   if (error) return res.status(500).json({ error: error.message });
