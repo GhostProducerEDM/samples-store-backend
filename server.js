@@ -6,26 +6,14 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-const allowedOrigins = [
-  'http://localhost:3000',
-  'https://billowing-waterfall-2c1f.yourghostproduceredm.workers.dev'
-];
-
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // allow Postman / server calls
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    } else {
-      return callback(new Error('Not allowed by CORS'));
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
-
-app.options('*', cors());
+app.use(cors({ origin: '*' }));
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
 app.use('/api/webhook/lemonsqueezy', express.raw({ type: 'application/json' }));
 app.use(express.json());
@@ -595,9 +583,9 @@ app.get('/api/pack-covers', async (req, res) => {
 });
 
 // ===== PACK PRODUCTS — список паков для продажи =====
-app.get('/api/packs', async (req, res) => {
+app.get('/api/pack-products', async (req, res) => {
   const { data, error } = await supabase
-    .from('packs')
+    .from('pack_products')
     .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url, producer, featured, created_at, cover_url')
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
