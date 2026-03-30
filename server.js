@@ -85,8 +85,20 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
 
   if (eventName === 'subscription_created' || eventName === 'subscription_renewed') {
     if (!planInfo) return res.json({ ok: true, skipped: true });
-    const { data: user } = await supabase.from('users').select('id, credits').eq('email', userEmail).single();
+    const { data: user } = await supabase.from('users').select('id, credits, subscription_id').eq('email', userEmail).single();
     if (!user) return res.status(404).json({ error: 'User not found' });
+    // Cancel previous subscription on upgrade (subscription_created only)
+    if (eventName === 'subscription_created' && user.subscription_id && user.subscription_id !== subscriptionId) {
+      try {
+        await fetch(`https://api.lemonsqueezy.com/v1/subscriptions/${user.subscription_id}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${process.env.LEMONSQUEEZY_API_KEY}`, Accept: 'application/vnd.api+json' },
+        });
+        console.log(`Cancelled old subscription ${user.subscription_id} for ${userEmail}`);
+      } catch (e) {
+        console.warn(`Failed to cancel old subscription ${user.subscription_id}:`, e.message);
+      }
+    }
     await supabase.from('users').update({
       credits: user.credits + planInfo.credits,
       plan: planInfo.plan,
@@ -425,8 +437,11 @@ app.post('/api/download', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { sampleId } = req.body;
-  const { data: user } = await supabase.from('users').select('credits, plan').eq('id', authUser.id).single();
+  const { data: user } = await supabase.from('users').select('credits, plan, renews_at').eq('id', authUser.id).single();
   if (!user) return res.status(400).json({ error: 'User not found' });
+  // Subscription must be active to spend credits
+  const hasActivePlan = user.plan && (!user.renews_at || new Date(user.renews_at) > new Date());
+  if (!hasActivePlan) return res.status(403).json({ error: 'Active subscription required to download' });
   const { data: sample } = await supabase.from('samples').select('id, url').eq('id', sampleId).single();
   if (!sample) return res.status(400).json({ error: 'Sample not found' });
   const { data: existing } = await supabase.from('user_downloads').select('id')
