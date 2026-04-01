@@ -61,6 +61,14 @@ const PLAN_CREDITS = {
 };
 const PLAN_PRICES = { starter: 9.99, pro: 19.99, unlimited: 29.99 };
 
+// One-time credit pack variants → credits to add
+const CREDIT_PACK_VARIANTS = {
+  [process.env.LS_VARIANT_CREDITS_50]:  50,
+  [process.env.LS_VARIANT_CREDITS_100]: 100,
+  [process.env.LS_VARIANT_CREDITS_200]: 200,
+};
+const CREDIT_PACK_PRICES = { 50: 4.99, 100: 8.99, 200: 15.99 };
+
 async function getUserFromToken(req) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   if (!token) return null;
@@ -150,7 +158,7 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
     if (user) await supabase.from('users').update({ plan: null, subscription_id: null, renews_at: null }).eq('id', user.id);
     return res.json({ ok: true });
   }
-  // ===== PACK PURCHASE (one-time order) =====
+  // ===== ONE-TIME ORDER (credit packs + pack purchases) =====
   if (eventName === 'order_created') {
     const orderAttrs = payload.data?.attributes;
     const orderEmail = orderAttrs?.user_email;
@@ -158,9 +166,28 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
     const orderVariantId = String(orderItems?.variant_id || '');
     const orderId = String(payload.data?.id || '');
 
-    console.log(`Pack order: ${orderId} | ${orderEmail} | variant: ${orderVariantId}`);
+    console.log(`Order: ${orderId} | ${orderEmail} | variant: ${orderVariantId}`);
 
-    // Find pack product by variant_id
+    // ── Credit pack purchase ──
+    const creditAmount = CREDIT_PACK_VARIANTS[orderVariantId];
+    if (creditAmount) {
+      const { data: user } = await supabase.from('users').select('id, credits').eq('email', orderEmail).single();
+      if (!user) {
+        console.log('User not found for credit pack purchase:', orderEmail);
+        return res.status(404).json({ error: 'User not found' });
+      }
+      await supabase.from('users').update({ credits: user.credits + creditAmount }).eq('id', user.id);
+      await supabase.from('credit_transactions').insert({
+        user_id: user.id,
+        credits_added: creditAmount,
+        source: 'purchase',
+        ls_order_id: orderId,
+      });
+      console.log(`+${creditAmount} credits (purchase) → ${orderEmail}`);
+      return res.json({ ok: true, credits_added: creditAmount });
+    }
+
+    // ── Pack purchase ──
     const { data: packProduct } = await supabase
       .from('pack_products')
       .select('pack_name, bonus_credits')
@@ -168,37 +195,24 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
       .single();
 
     if (!packProduct) {
-      console.log('No pack product found for variant:', orderVariantId);
+      console.log('No product found for variant:', orderVariantId);
       return res.json({ ok: true, skipped: true });
     }
 
-    // Find user by email
-    const { data: user } = await supabase
-      .from('users')
-      .select('id, credits')
-      .eq('email', orderEmail)
-      .single();
-
+    const { data: user } = await supabase.from('users').select('id, credits').eq('email', orderEmail).single();
     if (!user) {
       console.log('User not found for pack purchase:', orderEmail);
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Record pack purchase (ignore duplicate)
-    await supabase
-      .from('user_packs')
-      .upsert({
-        user_id: user.id,
-        pack_name: packProduct.pack_name,
-        ls_order_id: orderId,
-      }, { onConflict: 'user_id,pack_name' });
+    await supabase.from('user_packs').upsert({
+      user_id: user.id,
+      pack_name: packProduct.pack_name,
+      ls_order_id: orderId,
+    }, { onConflict: 'user_id,pack_name' });
 
-    // Add bonus credits
     if (packProduct.bonus_credits > 0) {
-      await supabase
-        .from('users')
-        .update({ credits: user.credits + packProduct.bonus_credits })
-        .eq('id', user.id);
+      await supabase.from('users').update({ credits: user.credits + packProduct.bonus_credits }).eq('id', user.id);
     }
 
     console.log(`Pack "${packProduct.pack_name}" granted to ${orderEmail} + ${packProduct.bonus_credits} bonus credits`);
@@ -805,12 +819,14 @@ app.get('/api/payment-history', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
 
-  const [{ data: packs }, { data: subs }, { data: products }] = await Promise.all([
+  const [{ data: packs }, { data: subs }, { data: products }, { data: creditTxns }] = await Promise.all([
     supabase.from('user_packs').select('pack_name, purchased_at, ls_order_id')
       .eq('user_id', authUser.id).order('purchased_at', { ascending: false }),
     supabase.from('subscriptions').select('plan, credits_added, created_at')
       .eq('user_id', authUser.id).order('created_at', { ascending: false }),
     supabase.from('pack_products').select('pack_name, price_usd'),
+    supabase.from('credit_transactions').select('credits_added, source, created_at')
+      .eq('user_id', authUser.id).order('created_at', { ascending: false }),
   ]);
 
   const priceMap = {};
@@ -830,7 +846,14 @@ app.get('/api/payment-history', async (req, res) => {
     amount: PLAN_PRICES[s.plan?.toLowerCase()] ?? null,
   }));
 
-  const result = [...packItems, ...subItems]
+  const creditItems = (creditTxns || []).map(t => ({
+    type: 'credits',
+    description: `${t.credits_added} credits`,
+    date: t.created_at,
+    amount: CREDIT_PACK_PRICES[t.credits_added] ?? null,
+  }));
+
+  const result = [...packItems, ...subItems, ...creditItems]
     .sort((a, b) => new Date(b.date) - new Date(a.date));
 
   res.json(result);
