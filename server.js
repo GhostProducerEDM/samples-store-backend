@@ -9,8 +9,10 @@ function signBunnyUrl(url, expirySeconds = 3600) {
   try {
     const urlObj = new URL(url);
     const expiry = Math.floor(Date.now() / 1000) + expirySeconds;
+    // Bunny expects the DECODED path (no %20 etc.) — matches their Go/PHP SDK behaviour
+    const filePath = decodeURIComponent(urlObj.pathname);
     const token = crypto.createHash('sha256')
-      .update(process.env.BUNNY_TOKEN_KEY + urlObj.pathname + expiry)
+      .update(process.env.BUNNY_TOKEN_KEY + filePath + expiry)
       .digest('base64')
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
     urlObj.searchParams.set('token', token);
