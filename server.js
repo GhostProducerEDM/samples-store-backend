@@ -2,7 +2,20 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+
+// ── Preview token (changes hourly, valid for current + previous hour) ──────────
+const PREVIEW_SECRET = process.env.PREVIEW_SECRET || 'gpe_preview_s3cr3t_2025';
+function genPreviewToken(hourOffset = 0) {
+  return crypto.createHmac('sha256', PREVIEW_SECRET)
+    .update(String(Math.floor(Date.now() / 3600000) + hourOffset))
+    .digest('hex').slice(0, 40);
+}
+function isValidPreviewToken(t) {
+  return t && (t === genPreviewToken(0) || t === genPreviewToken(-1));
+}
 const { createClient } = require('@supabase/supabase-js');
+const JSZip = require('jszip');
+const nodeFetch = require('node-fetch');
 
 const app = express();
 
@@ -232,7 +245,7 @@ app.get('/api/samples', async (req, res) => {
 
     let query = supabase
       .from('samples')
-      .select('id, title, preview_url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count', { count: 'exact' });
+      .select('id, title, preview_url, waveform_url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count', { count: 'exact' });
 
     // Text search — title, pack, instrument (partial) + genre, mood, artist_style (array contains)
     if (search?.trim()) {
@@ -257,20 +270,16 @@ app.get('/api/samples', async (req, res) => {
     }
 
     // Sorting
-    if (sort === 'popular') {
+    if (sort === 'popular' || sort === 'plays_desc') {
       query = query.order('play_count', { ascending: false });
+    } else if (sort === 'newest') {
+      query = query.order('created_at', { ascending: false });
     } else if (sort === 'bpm_asc') {
       query = query.order('bpm', { ascending: true });
     } else if (sort === 'bpm_desc') {
       query = query.order('bpm', { ascending: false });
-    } else if (sort === 'duration_asc') {
-      query = query.order('duration', { ascending: true });
-    } else if (sort === 'duration_desc') {
-      query = query.order('duration', { ascending: false });
     } else {
-      // Default: random via id ordering with modulo trick
-      // Use seed for consistent pagination
-      const s = parseInt(seed) || 1;
+      // Default: id order (stable)
       query = query.order('id', { ascending: true });
     }
 
@@ -321,6 +330,42 @@ app.get('/api/stream/:id', async (req, res) => {
     res.redirect(302, sample.url);
   } catch(e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== PREVIEW TOKEN — short-lived token for audio proxy =====
+app.get('/api/preview-token', (req, res) => {
+  res.json({ token: genPreviewToken(0), expiresIn: 3600 });
+});
+
+// ===== PREVIEW PROXY — pipes audio without exposing CDN URL =====
+app.get('/api/preview/:id', async (req, res) => {
+  if (!isValidPreviewToken(req.query.t)) {
+    return res.status(403).end();
+  }
+  try {
+    const { data: sample, error } = await supabase
+      .from('samples')
+      .select('preview_url')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !sample?.preview_url) return res.status(404).end();
+
+    const upHeaders = { 'User-Agent': 'Mozilla/5.0' };
+    if (req.headers['range']) upHeaders['Range'] = req.headers['range'];
+
+    const upstream = await nodeFetch(sample.preview_url, { headers: upHeaders });
+
+    res.status(upstream.status);
+    for (const h of ['content-type','content-length','content-range','accept-ranges']) {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    upstream.body.pipe(res).on('error', () => res.end());
+  } catch(e) {
+    res.status(500).end();
   }
 });
 
@@ -458,7 +503,7 @@ app.get('/api/downloads', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { data, error } = await supabase.from('user_downloads')
-    .select('sample_id, downloaded_at, samples(title, preview_url, instrument, bpm, key, cover, pack)')
+    .select('sample_id, downloaded_at, samples(title, preview_url, waveform_url, instrument, bpm, key, cover, pack)')
     .eq('user_id', authUser.id).order('downloaded_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -481,7 +526,7 @@ app.get('/api/likes', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { data, error } = await supabase.from('user_likes')
-    .select('sample_id, liked_at, samples(title, preview_url, instrument, bpm, key, cover, pack)')
+    .select('sample_id, liked_at, samples(title, preview_url, waveform_url, instrument, bpm, key, cover, pack)')
     .eq('user_id', authUser.id).order('liked_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -547,9 +592,23 @@ app.delete('/api/pack-likes', async (req, res) => {
 // ===== RECORD PLAY =====
 app.post('/api/plays', async (req, res) => {
   const authUser = await getUserFromToken(req);
-  const { sampleId } = req.body;
+  const { sampleId, referrer, page, sessionId } = req.body;
   if (!sampleId) return res.status(400).json({ error: 'sampleId required' });
-  if (authUser) await supabase.from('user_plays').insert({ user_id: authUser.id, sample_id: sampleId });
+
+  const ip = (req.headers['cf-connecting-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0] || req.ip || '').trim() || null;
+  const country = req.headers['cf-ipcountry'] || null;
+  const userAgent = (req.headers['user-agent'] || '').slice(0, 512) || null;
+
+  await supabase.from('user_plays').insert({
+    user_id: authUser?.id || null,
+    sample_id: sampleId,
+    session_id: sessionId || null,
+    referrer: referrer ? referrer.slice(0, 512) : null,
+    page: page || null,
+    ip,
+    country,
+    user_agent: userAgent,
+  });
   try { await supabase.rpc('increment_play_count', { sample_id: sampleId }); } catch(e) {}
   res.json({ ok: true });
 });
@@ -595,6 +654,64 @@ app.get('/api/pack-covers', async (req, res) => {
     result[pack] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
   });
   res.json(result);
+});
+
+// ===== RECENT PLAYS — last 20 plays for a user =====
+app.get('/api/recent-plays', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const { data, error } = await supabase
+    .from('user_plays')
+    .select('id, sample_id, page, played_at, samples(id, title, preview_url, waveform_url, cover, bpm, key, instrument, type, pack)')
+    .eq('user_id', authUser.id)
+    .order('played_at', { ascending: false })
+    .limit(20);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ===== PACK PREVIEW — first sample preview_url for a pack (for demo playback) =====
+app.get('/api/pack-preview', async (req, res) => {
+  const { pack } = req.query;
+  if (!pack) return res.status(400).json({ error: 'pack required' });
+  const { data, error } = await supabase
+    .from('samples')
+    .select('id, title, preview_url')
+    .eq('pack', pack)
+    .not('preview_url', 'is', null)
+    .limit(1)
+    .single();
+  if (error || !data) return res.status(404).json({ error: 'No preview available' });
+  res.json(data);
+});
+
+// ===== WAVEFORM PROXY (CORS workaround for Bunny CDN) =====
+app.get('/api/waveform-proxy', async (req, res) => {
+  const url = req.query.url;
+  if (!url || !url.startsWith('https://gpe-samples-store-pl.b-cdn.net/')) {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return res.status(r.status).json({ error: 'CDN error' });
+    const data = await r.json();
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== FEATURED SAMPLES — guest first page =====
+app.get('/api/featured-samples', async (req, res) => {
+  const { data, error } = await supabase
+    .from('featured_samples')
+    .select('samples(id, title, preview_url, waveform_url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count)')
+    .order('position', { ascending: true })
+    .limit(50);
+  if (error) return res.status(500).json({ error: error.message });
+  const samples = (data || []).map(r => r.samples).filter(Boolean);
+  res.json({ samples, total: samples.length });
 });
 
 // ===== PACK PRODUCTS — список паков для продажи =====
@@ -729,12 +846,12 @@ app.get('/api/user-packs', async (req, res) => {
   res.json(data || []);
 });
 
-// ===== PACKS with covers (for player strip) =====
+// ===== PACKS with covers, genres, play_count =====
 app.get('/api/packs', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('samples')
-      .select('pack, cover, genre, bpm')
+      .select('pack, cover, genre, bpm, play_count')
       .not('pack', 'is', null);
 
     if (error) return res.status(500).json({ error: error.message });
@@ -743,22 +860,26 @@ app.get('/api/packs', async (req, res) => {
     (data || []).forEach(s => {
       if (!s.pack) return;
       if (!packMap[s.pack]) {
-        packMap[s.pack] = { name: s.pack, cover: null, genre: null, bpm: null, count: 0, _cc: {} };
+        packMap[s.pack] = { name: s.pack, cover: null, genres: [], bpm: null, count: 0, play_count: 0, _cc: {}, _gc: {} };
       }
       const p = packMap[s.pack];
       p.count++;
+      p.play_count += (s.play_count || 0);
       if (s.cover) p._cc[s.cover] = (p._cc[s.cover] || 0) + 1;
-      if (!p.genre && s.genre) p.genre = Array.isArray(s.genre) ? s.genre[0] : s.genre;
+      const genres = Array.isArray(s.genre) ? s.genre : (s.genre ? [s.genre] : []);
+      genres.forEach(g => { if (g) p._gc[g] = (p._gc[g] || 0) + 1; });
       if (!p.bpm && s.bpm) p.bpm = s.bpm;
     });
 
     const packs = Object.values(packMap).map(p => {
       const entries = Object.entries(p._cc);
       if (entries.length) p.cover = entries.sort((a,b) => b[1]-a[1])[0][0];
-      delete p._cc;
+      p.genres = Object.entries(p._gc).sort((a,b) => b[1]-a[1]).map(e => e[0]).slice(0, 5);
+      delete p._cc; delete p._gc;
       return p;
     }).sort((a, b) => b.count - a.count);
 
+    res.set('Cache-Control', 'public, max-age=300');
     res.json(packs);
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -1055,6 +1176,116 @@ app.post('/api/admin/tools/fix-covers', requireAdmin, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ===== RECOMMENDATIONS — based on user's downloaded genres/instruments =====
+app.get('/api/recommendations', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data: downloads } = await supabase
+    .from('user_downloads')
+    .select('sample_id, samples(genre, instrument)')
+    .eq('user_id', authUser.id)
+    .order('downloaded_at', { ascending: false })
+    .limit(50);
+
+  if (!downloads?.length) return res.json([]);
+
+  const downloadedIds = downloads.map(d => d.sample_id);
+
+  const genreCount = {};
+  const instrCount = {};
+  downloads.forEach(d => {
+    const s = d.samples;
+    if (!s) return;
+    if (Array.isArray(s.genre)) s.genre.forEach(g => { genreCount[g] = (genreCount[g] || 0) + 1; });
+    if (s.instrument) instrCount[s.instrument] = (instrCount[s.instrument] || 0) + 1;
+  });
+
+  const topGenres = Object.entries(genreCount).sort((a,b) => b[1]-a[1]).slice(0,3).map(([g]) => g);
+  const topInstr  = Object.entries(instrCount).sort((a,b)  => b[1]-a[1]).slice(0,2).map(([i]) => i);
+
+  if (!topGenres.length && !topInstr.length) return res.json([]);
+
+  const orParts = [
+    ...topGenres.map(g => `genre.cs.{${g}}`),
+    ...topInstr.map(i => `instrument.ilike.%${i}%`),
+  ].join(',');
+
+  const { data, error } = await supabase
+    .from('samples')
+    .select('id, title, preview_url, waveform_url, cover, bpm, key, genre, instrument, type, pack')
+    .or(orParts)
+    .not('id', 'in', `(${downloadedIds.join(',')})`)
+    .order('play_count', { ascending: false })
+    .limit(20);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ===== DOWNLOAD LIBRARY AS ZIP =====
+app.get('/api/download-library-zip', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  // Get all downloaded samples for this user (title + url)
+  const { data: downloads, error } = await supabase
+    .from('user_downloads')
+    .select('sample_id, samples(title, url)')
+    .eq('user_id', authUser.id)
+    .order('downloaded_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: 'Could not fetch library' });
+  if (!downloads || downloads.length === 0) {
+    return res.status(400).json({ error: 'Library is empty' });
+  }
+
+  const zip = new JSZip();
+  const CONCURRENCY = 5;
+
+  // Fetch all files and add to zip
+  const queue = [...downloads];
+  const usedNames = new Set();
+
+  async function processItem(item) {
+    const sample = item.samples;
+    if (!sample?.url) return;
+    try {
+      const fileRes = await nodeFetch(sample.url, { timeout: 30000 });
+      if (!fileRes.ok) return;
+      const buffer = await fileRes.buffer();
+      // Sanitize filename, ensure unique
+      let name = (sample.title || `sample_${item.sample_id}`)
+        .replace(/[^\w\s\-().]/g, '')
+        .trim()
+        .substring(0, 80) + '.wav';
+      let unique = name;
+      let n = 1;
+      while (usedNames.has(unique)) unique = name.replace('.wav', `_${n++}.wav`);
+      usedNames.add(unique);
+      zip.file(unique, buffer);
+    } catch(e) {
+      console.warn('ZIP: failed to fetch', sample?.url, e.message);
+    }
+  }
+
+  // Process in batches of CONCURRENCY
+  for (let i = 0; i < queue.length; i += CONCURRENCY) {
+    await Promise.all(queue.slice(i, i + CONCURRENCY).map(processItem));
+  }
+
+  if (Object.keys(zip.files).length === 0) {
+    return res.status(500).json({ error: 'All files failed to download' });
+  }
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', 'attachment; filename="my-library.zip"');
+
+  zip.generateNodeStream({ type: 'nodebuffer', streamFiles: true })
+    .pipe(res)
+    .on('error', err => { console.error('ZIP stream error:', err); res.end(); });
 });
 
 // ===== START =====
