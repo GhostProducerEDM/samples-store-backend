@@ -3,6 +3,22 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 
+// ── Bunny CDN signed URL (SHA-256, NOT HMAC — per Bunny docs) ────────────────
+function signBunnyUrl(url, expirySeconds = 3600) {
+  if (!process.env.BUNNY_TOKEN_KEY || !url) return url;
+  try {
+    const urlObj = new URL(url);
+    const expiry = Math.floor(Date.now() / 1000) + expirySeconds;
+    const token = crypto.createHash('sha256')
+      .update(process.env.BUNNY_TOKEN_KEY + urlObj.pathname + expiry)
+      .digest('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    urlObj.searchParams.set('token', token);
+    urlObj.searchParams.set('expires', String(expiry));
+    return urlObj.toString();
+  } catch(e) { return url; }
+}
+
 // ── Preview token (changes hourly, valid for current + previous hour) ──────────
 const PREVIEW_SECRET = process.env.PREVIEW_SECRET || 'gpe_preview_s3cr3t_2025';
 function genPreviewToken(hourOffset = 0) {
@@ -314,20 +330,7 @@ app.get('/api/stream/:id', async (req, res) => {
 
     if (error || !sample?.url) return res.status(404).json({ error: 'Not found' });
 
-    // Optional: Bunny.net token-signed URL (set BUNNY_TOKEN_KEY in .env)
-    if (process.env.BUNNY_TOKEN_KEY && sample.url.includes('b-cdn.net')) {
-      const expiry = Math.floor(Date.now() / 1000) + 3600;
-      const urlObj = new URL(sample.url);
-      const token = crypto.createHmac('sha256', process.env.BUNNY_TOKEN_KEY)
-        .update(process.env.BUNNY_TOKEN_KEY + urlObj.pathname + expiry)
-        .digest('base64')
-        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-      urlObj.searchParams.set('token', token);
-      urlObj.searchParams.set('expires', String(expiry));
-      return res.redirect(302, urlObj.toString());
-    }
-
-    res.redirect(302, sample.url);
+    res.redirect(302, signBunnyUrl(sample.url));
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -355,7 +358,7 @@ app.get('/api/preview/:id', async (req, res) => {
     const upHeaders = { 'User-Agent': 'Mozilla/5.0' };
     if (req.headers['range']) upHeaders['Range'] = req.headers['range'];
 
-    const upstream = await nodeFetch(sample.preview_url, { headers: upHeaders });
+    const upstream = await nodeFetch(signBunnyUrl(sample.preview_url, 300), { headers: upHeaders });
 
     res.status(upstream.status);
     for (const h of ['content-type','content-length','content-range','accept-ranges']) {
@@ -491,11 +494,11 @@ app.post('/api/download', async (req, res) => {
   if (!sample) return res.status(400).json({ error: 'Sample not found' });
   const { data: existing } = await supabase.from('user_downloads').select('id')
     .eq('user_id', authUser.id).eq('sample_id', sampleId).single();
-  if (existing) return res.json({ url: sample.url });
+  if (existing) return res.json({ url: signBunnyUrl(sample.url) });
   if (user.credits <= 0) return res.status(400).json({ error: 'No credits' });
   await supabase.from('users').update({ credits: user.credits - 1 }).eq('id', authUser.id);
   await supabase.from('user_downloads').insert({ user_id: authUser.id, sample_id: sampleId });
-  res.json({ url: sample.url });
+  res.json({ url: signBunnyUrl(sample.url) });
 });
 
 // ===== DOWNLOADS HISTORY =====
@@ -692,7 +695,7 @@ app.get('/api/waveform-proxy', async (req, res) => {
     return res.status(400).json({ error: 'Invalid URL' });
   }
   try {
-    const r = await fetch(url);
+    const r = await fetch(signBunnyUrl(url, 300));
     if (!r.ok) return res.status(r.status).json({ error: 'CDN error' });
     const data = await r.json();
     res.set('Cache-Control', 'public, max-age=86400');
