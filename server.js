@@ -541,16 +541,57 @@ app.get('/api/downloads', async (req, res) => {
   res.json(data || []);
 });
 
-// ===== BUY CREDITS =====
-app.post('/api/buy', async (req, res) => {
+// ===== CREATE CHECKOUT (server-side, embeds user_id in custom_data) =====
+app.post('/api/create-checkout', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
-  const { amount } = req.body;
-  const { data: user } = await supabase.from('users').select('credits').eq('id', authUser.id).single();
+
+  const { variant_id } = req.body;
+  if (!variant_id) return res.status(400).json({ error: 'variant_id required' });
+
+  const apiKey = process.env.LEMONSQUEEZY_API_KEY;
+  const storeId = process.env.LS_STORE_ID;
+  if (!apiKey || !storeId) return res.status(500).json({ error: 'LS not configured' });
+
+  const { data: user } = await supabase.from('users').select('email').eq('id', authUser.id).single();
   if (!user) return res.status(404).json({ error: 'User not found' });
-  const { data } = await supabase.from('users').update({ credits: user.credits + amount })
-    .eq('id', authUser.id).select('credits').single();
-  res.json({ success: true, credits: data.credits });
+
+  try {
+    const lsRes = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: 'application/vnd.api+json',
+        'Content-Type': 'application/vnd.api+json',
+      },
+      body: JSON.stringify({
+        data: {
+          type: 'checkouts',
+          attributes: {
+            checkout_data: {
+              email: user.email,
+            },
+          },
+          relationships: {
+            store:   { data: { type: 'stores',   id: String(storeId)   } },
+            variant: { data: { type: 'variants',  id: String(variant_id) } },
+          },
+        },
+      }),
+    });
+
+    const json = await lsRes.json();
+    if (!lsRes.ok) {
+      console.error('LS checkout error:', JSON.stringify(json));
+      return res.status(502).json({ error: 'Failed to create checkout' });
+    }
+
+    const url = json.data?.attributes?.url;
+    res.json({ url });
+  } catch (e) {
+    console.error('create-checkout error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== LIKES =====
