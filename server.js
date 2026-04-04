@@ -570,6 +570,7 @@ app.post('/api/create-checkout', async (req, res) => {
           attributes: {
             checkout_data: {
               email: user.email,
+              custom: { user_id: authUser.id },
             },
           },
           relationships: {
@@ -791,7 +792,7 @@ app.get('/api/featured-samples', async (req, res) => {
 app.get('/api/pack-products', async (req, res) => {
   const { data, error } = await supabase
     .from('pack_products')
-    .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url, producer, featured, created_at, cover_url')
+    .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url, producer, featured, created_at, cover_url, preview_url')
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -965,6 +966,165 @@ app.get('/api/packs', async (req, res) => {
     res.json(packs);
   } catch(e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== COLLECTIONS =====
+
+app.get('/api/collections', async (req, res) => {
+  try {
+    const { data: collections, error } = await supabase
+      .from('collections')
+      .select('id, title, slug, genre, cover_url, price_credits, created_at')
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+
+    const { data: countRows } = await supabase
+      .from('collection_samples')
+      .select('collection_id');
+
+    const countMap = {};
+    (countRows || []).forEach(r => {
+      countMap[r.collection_id] = (countMap[r.collection_id] || 0) + 1;
+    });
+
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json((collections || []).map(c => ({ ...c, sample_count: countMap[c.id] || 0 })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/collections/:slug', async (req, res) => {
+  try {
+    const { data: collection, error: colErr } = await supabase
+      .from('collections')
+      .select('id, title, slug, description, genre, cover_url, price_credits, created_at')
+      .eq('slug', req.params.slug)
+      .single();
+    if (colErr || !collection) return res.status(404).json({ error: 'Collection not found' });
+
+    const { data: rows, error: samplesErr } = await supabase
+      .from('collection_samples')
+      .select('position, samples(id, title, preview_url, waveform_url, cover, bpm, key, genre, instrument, type, pack, mood, play_count)')
+      .eq('collection_id', collection.id)
+      .order('position', { ascending: true });
+    if (samplesErr) return res.status(500).json({ error: samplesErr.message });
+
+    const samples = (rows || [])
+      .filter(r => r.samples)
+      .map(r => ({ ...r.samples, position: r.position }));
+
+    const cover_url = collection.cover_url || samples.find(s => s.cover)?.cover || null;
+
+    res.json({ ...collection, cover_url, samples });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/collection-access', async (req, res) => {
+  try {
+    const authUser = await getUserFromToken(req);
+    if (!authUser) return res.json({ access: false });
+
+    const { slug } = req.query;
+    if (!slug) return res.status(400).json({ error: 'slug required' });
+
+    const { data: collection } = await supabase
+      .from('collections').select('id').eq('slug', slug).single();
+    if (!collection) return res.json({ access: false });
+
+    const { data } = await supabase
+      .from('user_collection_downloads')
+      .select('downloaded_at')
+      .eq('user_id', authUser.id)
+      .eq('collection_id', collection.id)
+      .single();
+
+    res.json({ access: !!data, downloaded_at: data?.downloaded_at || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// NOTE: For 50+ sample collections, consider pre-building ZIPs and storing a zip_url
+// on the collections table. On-the-fly generation may approach timeout limits on Render.
+app.post('/api/collections/:slug/download', async (req, res) => {
+  try {
+    const authUser = await getUserFromToken(req);
+    if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: collection, error: colErr } = await supabase
+      .from('collections').select('id, title, price_credits')
+      .eq('slug', req.params.slug).single();
+    if (colErr || !collection) return res.status(404).json({ error: 'Collection not found' });
+
+    const { data: existing } = await supabase
+      .from('user_collection_downloads')
+      .select('downloaded_at')
+      .eq('user_id', authUser.id)
+      .eq('collection_id', collection.id)
+      .single();
+
+    if (!existing) {
+      const { data: user } = await supabase
+        .from('users').select('credits, plan, renews_at')
+        .eq('id', authUser.id).single();
+      if (!user) return res.status(404).json({ error: 'User not found' });
+
+      const hasActivePlan = user.plan && (!user.renews_at || new Date(user.renews_at) > new Date());
+      if (!hasActivePlan) return res.status(403).json({ error: 'Active subscription required' });
+
+      const cost = collection.price_credits;
+      if (user.credits < cost) return res.status(400).json({ error: 'No credits' });
+
+      const { error: deductErr } = await supabase
+        .from('users').update({ credits: user.credits - cost }).eq('id', authUser.id);
+      if (deductErr) return res.status(500).json({ error: 'Failed to deduct credits' });
+
+      await supabase.from('user_collection_downloads')
+        .insert({ user_id: authUser.id, collection_id: collection.id });
+    }
+
+    const { data: rows, error: samplesErr } = await supabase
+      .from('collection_samples')
+      .select('position, samples(id, title, url)')
+      .eq('collection_id', collection.id)
+      .order('position', { ascending: true });
+    if (samplesErr) return res.status(500).json({ error: 'Failed to fetch samples' });
+
+    const samples = (rows || []).filter(r => r.samples?.url).map(r => r.samples);
+    if (samples.length === 0) return res.status(500).json({ error: 'No samples available' });
+
+    const zip = new JSZip();
+    const usedNames = new Set();
+
+    async function fetchAndAdd(sample) {
+      try {
+        const fileRes = await nodeFetch(sample.url, { timeout: 30000 });
+        if (!fileRes.ok) return;
+        const buffer = await fileRes.buffer();
+        let name = (sample.title || `sample_${sample.id}`)
+          .replace(/[^\w\s\-().]/g, '').trim().substring(0, 80) + '.wav';
+        let unique = name, n = 1;
+        while (usedNames.has(unique)) unique = name.replace('.wav', `_${n++}.wav`);
+        usedNames.add(unique);
+        zip.file(unique, buffer);
+      } catch (e) { console.warn('Collection ZIP: skip', sample?.title, e.message); }
+    }
+
+    for (let i = 0; i < samples.length; i += 5) {
+      await Promise.all(samples.slice(i, i + 5).map(fetchAndAdd));
+    }
+
+    if (Object.keys(zip.files).length === 0)
+      return res.status(500).json({ error: 'All files failed to download' });
+
+    const safeName = (collection.title || req.params.slug).replace(/[^a-zA-Z0-9\-_. ]/g, '_');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.zip"`);
+    zip.generateNodeStream({ type: 'nodebuffer', streamFiles: true })
+      .pipe(res)
+      .on('error', err => { console.error('ZIP stream error:', err); res.end(); });
+
+  } catch (e) {
+    console.error('Collection download error:', e);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
 });
 
