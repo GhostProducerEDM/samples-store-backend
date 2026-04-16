@@ -3,6 +3,18 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 
+// ── Simple in-memory cache ───────────────────────────────────────────────────
+const _cache = {};
+function cacheGet(key) {
+  const e = _cache[key];
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) { delete _cache[key]; return null; }
+  return e.value;
+}
+function cacheSet(key, value, ttlMs) {
+  _cache[key] = { value, expiresAt: Date.now() + ttlMs };
+}
+
 // ── Bunny CDN signed URL (SHA-256, NOT HMAC — per Bunny docs) ────────────────
 function signBunnyUrl(url, expirySeconds = 3600) {
   if (!process.env.BUNNY_TOKEN_KEY || !url) return url;
@@ -21,15 +33,18 @@ function signBunnyUrl(url, expirySeconds = 3600) {
   } catch(e) { return url; }
 }
 
-// ── Preview token (changes hourly, valid for current + previous hour) ──────────
+// ── Preview token — привязан к IP + час, нельзя использовать с другого адреса ──
 const PREVIEW_SECRET = process.env.PREVIEW_SECRET || 'gpe_preview_s3cr3t_2025';
-function genPreviewToken(hourOffset = 0) {
+function getClientIp(req) {
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '';
+}
+function genPreviewToken(ip, hourOffset = 0) {
   return crypto.createHmac('sha256', PREVIEW_SECRET)
-    .update(String(Math.floor(Date.now() / 3600000) + hourOffset))
+    .update(String(Math.floor(Date.now() / 3600000) + hourOffset) + ip)
     .digest('hex').slice(0, 40);
 }
-function isValidPreviewToken(t) {
-  return t && (t === genPreviewToken(0) || t === genPreviewToken(-1));
+function isValidPreviewToken(t, ip) {
+  return t && (t === genPreviewToken(ip, 0) || t === genPreviewToken(ip, -1));
 }
 const { createClient } = require('@supabase/supabase-js');
 const JSZip = require('jszip');
@@ -290,7 +305,7 @@ app.get('/api/samples', async (req, res) => {
 
     let query = supabase
       .from('samples')
-      .select('id, title, preview_url, waveform_url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count', { count: 'exact' });
+      .select('id, title, preview_url, waveform_url, cover, bpm, key, genre, instrument, type, pack, mood, artist_style, subgenre, tags, play_count, bunny_video_id, bunny_library_id', { count: 'exact' });
 
     // Text search — title, pack, instrument (partial) + genre, mood, artist_style (array contains)
     if (search?.trim()) {
@@ -367,12 +382,12 @@ app.get('/api/stream/:id', async (req, res) => {
 
 // ===== PREVIEW TOKEN — short-lived token for audio proxy =====
 app.get('/api/preview-token', (req, res) => {
-  res.json({ token: genPreviewToken(0), expiresIn: 3600 });
+  res.json({ token: genPreviewToken(getClientIp(req), 0), expiresIn: 3600 });
 });
 
 // ===== PREVIEW PROXY — pipes audio without exposing CDN URL =====
 app.get('/api/preview/:id', async (req, res) => {
-  if (!isValidPreviewToken(req.query.t)) {
+  if (!isValidPreviewToken(req.query.t, getClientIp(req))) {
     return res.status(403).end();
   }
   try {
@@ -412,6 +427,15 @@ app.get('/api/samples/count', async (req, res) => {
 app.get('/api/filters', async (req, res) => {
   try {
     const genreParam = req.query.genre || null;
+    const cacheKey = 'filters:' + (genreParam || 'all');
+
+    // Serve from cache (5 min TTL) — this endpoint scans the entire library
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      res.set('Cache-Control', 'public, max-age=300');
+      return res.json(cached);
+    }
+
     const { data: allData, error } = await fetchAll((from, to) =>
       supabase.from('samples')
         .select('instrument, genre, type, key, mood, artist_style, subgenre, pack, cover')
@@ -491,7 +515,7 @@ app.get('/api/filters', async (req, res) => {
     const instrument_counts = countScalar(data, 'instrument');
     const artist_style_counts = countArrayField(data, 'artist_style');
 
-    res.json({
+    const result = {
       instruments:   unique(data, 'instrument'),
       genres:        unique(data, 'genre', true),
       types:         unique(data, 'type'),
@@ -503,7 +527,11 @@ app.get('/api/filters', async (req, res) => {
       pack_covers,
       instrument_counts,
       artist_style_counts,
-    });
+    };
+
+    cacheSet(cacheKey, result, 5 * 60 * 1000); // 5 min server-side cache
+    res.set('Cache-Control', 'public, max-age=300'); // 5 min browser cache
+    res.json(result);
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -790,12 +818,20 @@ app.get('/api/featured-samples', async (req, res) => {
 
 // ===== PACK PRODUCTS — список паков для продажи =====
 app.get('/api/pack-products', async (req, res) => {
+  const cached = cacheGet('pack-products');
+  if (cached) {
+    res.set('Cache-Control', 'public, max-age=300');
+    return res.json(cached);
+  }
   const { data, error } = await supabase
     .from('pack_products')
     .select('pack_name, price_usd, bonus_credits, ls_variant_id, download_url, producer, featured, created_at, cover_url, preview_url')
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  const result = data || [];
+  cacheSet('pack-products', result, 5 * 60 * 1000);
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json(result);
 });
 
 // POST /api/admin/pack-products — upsert a pack product entry (admin only)
@@ -971,11 +1007,76 @@ app.get('/api/packs', async (req, res) => {
 
 // ===== COLLECTIONS =====
 
+// GET /api/my-collection-likes — slugs the user has liked
+app.get('/api/my-collection-likes', async (req, res) => {
+  try {
+    const authUser = await getUserFromToken(req);
+    if (!authUser) return res.json([]);
+    const { data } = await supabase
+      .from('collection_likes')
+      .select('liked_at, collections(slug, title, cover_url, price_credits)')
+      .eq('user_id', authUser.id);
+    res.json((data || []).map(r => ({
+      slug: r.collections?.slug,
+      title: r.collections?.title,
+      cover_url: r.collections?.cover_url,
+      price_credits: r.collections?.price_credits,
+      liked_at: r.liked_at,
+    })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/collection-likes — like a collection
+app.post('/api/collection-likes', async (req, res) => {
+  try {
+    const authUser = await getUserFromToken(req);
+    if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+    const { slug } = req.body;
+    if (!slug) return res.status(400).json({ error: 'slug required' });
+    const { data: col } = await supabase.from('collections').select('id').eq('slug', slug).single();
+    if (!col) return res.status(404).json({ error: 'Collection not found' });
+    await supabase.from('collection_likes').upsert({ user_id: authUser.id, collection_id: col.id });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/collection-likes — unlike a collection
+app.delete('/api/collection-likes', async (req, res) => {
+  try {
+    const authUser = await getUserFromToken(req);
+    if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+    const { slug } = req.body;
+    if (!slug) return res.status(400).json({ error: 'slug required' });
+    const { data: col } = await supabase.from('collections').select('id').eq('slug', slug).single();
+    if (!col) return res.status(404).json({ error: 'Collection not found' });
+    await supabase.from('collection_likes').delete().eq('user_id', authUser.id).eq('collection_id', col.id);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/my-collection-downloads', async (req, res) => {
+  try {
+    const authUser = await getUserFromToken(req);
+    if (!authUser) return res.json([]);
+    const { data } = await supabase
+      .from('user_collection_downloads')
+      .select('downloaded_at, collections(slug, title, cover_url, price_credits)')
+      .eq('user_id', authUser.id);
+    res.json((data || []).map(r => ({
+      slug: r.collections?.slug,
+      title: r.collections?.title,
+      cover_url: r.collections?.cover_url,
+      price_credits: r.collections?.price_credits,
+      downloaded_at: r.downloaded_at,
+    })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/collections', async (req, res) => {
   try {
     const { data: collections, error } = await supabase
       .from('collections')
-      .select('id, title, slug, genre, cover_url, price_credits, created_at')
+      .select('*')
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
 
@@ -1090,6 +1191,24 @@ app.post('/api/collections/:slug/download', async (req, res) => {
 
     const samples = (rows || []).filter(r => r.samples?.url).map(r => r.samples);
     if (samples.length === 0) return res.status(500).json({ error: 'No samples available' });
+
+    // Bulk-record all samples as downloaded — for stats, library dedup, and Trending Now.
+    // Only on first purchase (not re-download). Skip any sample_ids already in user_downloads.
+    if (!existing && samples.length > 0) {
+      const sampleIds = samples.map(s => s.id);
+      const { data: alreadyDl } = await supabase
+        .from('user_downloads')
+        .select('sample_id')
+        .eq('user_id', authUser.id)
+        .in('sample_id', sampleIds);
+      const alreadySet = new Set((alreadyDl || []).map(r => r.sample_id));
+      const newDlRows = sampleIds
+        .filter(id => !alreadySet.has(id))
+        .map(id => ({ user_id: authUser.id, sample_id: id }));
+      if (newDlRows.length > 0) {
+        await supabase.from('user_downloads').insert(newDlRows);
+      }
+    }
 
     const zip = new JSZip();
     const usedNames = new Set();
