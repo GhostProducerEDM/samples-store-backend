@@ -164,6 +164,13 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   console.log(`Webhook: ${eventName} | ${userEmail} | variant: ${variantId} | sub_id: ${subscriptionId} | custom_user_id: ${customUserId}`);
   console.log(`Webhook env variants — starter:${process.env.LS_VARIANT_STARTER} pro:${process.env.LS_VARIANT_PRO} unlimited:${process.env.LS_VARIANT_UNLIMITED}`);
 
+  // Safety guard: never process a subscription event with an empty/missing subscription ID
+  const isSubEvent = eventName?.startsWith('subscription_');
+  if (isSubEvent && !subscriptionId) {
+    console.warn(`⚠️  ${eventName}: missing subscription ID in payload — skipping to avoid data corruption`);
+    return res.json({ ok: true, skipped: true, reason: 'missing subscription_id' });
+  }
+
   // Helper: find user by custom_data.user_id first, fall back to email
   async function findUser(selectFields = 'id, credits') {
     if (customUserId) {
@@ -246,10 +253,11 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
         subscription_id: subscriptionId, // always restore from webhook payload
       };
       if (renewsAt) updateData.current_period_end = renewsAt;
-      // Restore plan from webhook if it was cleared
-      if (planInfo?.plan) updateData.plan = planInfo.plan;
+      // Set plan: prefer webhook mapping, fall back to existing DB value (never null it out on cancel)
+      const resolvedPlan = planInfo?.plan || user.plan || null;
+      if (resolvedPlan) updateData.plan = resolvedPlan;
       await supabase.from('users').update(updateData).eq('id', user.id);
-      console.log(`Sub ${subscriptionId} cancelled for ${userEmail} — plan: ${planInfo?.plan}, access until ${renewsAt}`);
+      console.log(`Sub ${subscriptionId} cancelled for ${userEmail} — plan: ${resolvedPlan}, access until ${renewsAt}`);
     } else if (user) {
       console.log(`Ignoring subscription_cancelled for old sub ${subscriptionId} — active: ${user.subscription_id}`);
     }
@@ -259,14 +267,16 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   if (eventName === 'subscription_expired') {
     const user = await findUser('id, subscription_id');
     if (user && (user.subscription_id === subscriptionId || !user.subscription_id)) {
-      // Period ended — remove Pro privileges but KEEP subscription_id (needed for resume)
-      await supabase.from('users').update({
+      // Period ended — remove Pro privileges, preserve subscription_id for resume
+      const expiredUpdate = {
         plan: null,
         subscription_status: 'expired',
-        subscription_id: subscriptionId, // restore from webhook if it was cleared
         renews_at: null,
         current_period_end: null,
-      }).eq('id', user.id);
+      };
+      // Only update subscription_id if webhook provides a valid non-empty value
+      if (subscriptionId) expiredUpdate.subscription_id = subscriptionId;
+      await supabase.from('users').update(expiredUpdate).eq('id', user.id);
       console.log(`Sub ${subscriptionId} expired for ${userEmail} — plan cleared, sub_id kept`);
     } else if (user) {
       console.log(`Ignoring subscription_expired for old sub ${subscriptionId} — active: ${user.subscription_id}`);
@@ -336,16 +346,15 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   }
 
   if (eventName === 'subscription_resumed') {
-    const user = await findUser('id, subscription_id');
+    const user = await findUser('id, subscription_id, plan');
     if (user) {
-      // Accept resume even if subscription_id was cleared (e.g. old cancel logic wiped it)
-      const resumePlan = planInfo?.plan || null;
-      const updateData = {
-        subscription_status: 'active',
-        subscription_id: subscriptionId,
-        renews_at: renewsAt,
-        current_period_end: renewsAt,
-      };
+      // Prefer webhook plan, fall back to existing DB plan (never null it out on resume)
+      const resumePlan = planInfo?.plan || user.plan || null;
+      const updateData = { subscription_status: 'active' };
+      // Only set subscription_id if webhook provides a non-empty value
+      if (subscriptionId) updateData.subscription_id = subscriptionId;
+      // Only set renews_at / current_period_end if webhook provides a value
+      if (renewsAt) { updateData.renews_at = renewsAt; updateData.current_period_end = renewsAt; }
       if (resumePlan) updateData.plan = resumePlan;
       await supabase.from('users').update(updateData).eq('id', user.id);
       console.log(`Sub ${subscriptionId} resumed for ${userEmail} — plan: ${resumePlan}, renews: ${renewsAt}`);
@@ -360,15 +369,16 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
 
     if (lsStatus === 'active' || lsStatus === 'on_trial') {
       // Always sync on active — covers resume, plan change, billing date update
-      const user = await findUser('id, subscription_status');
+      const user = await findUser('id, subscription_status, plan');
       if (user) {
-        const resumePlan = planInfo?.plan || null;
+        // Prefer webhook plan mapping, fall back to existing DB plan (never null it out)
+        const resumePlan = planInfo?.plan || user.plan || null;
         const updateData = {
           subscription_status: 'active',
           subscription_id: subscriptionId,
-          renews_at: renewsAt,
-          current_period_end: renewsAt,
         };
+        // Only update renews_at/current_period_end if webhook provides a value — avoid nulling them out
+        if (renewsAt) { updateData.renews_at = renewsAt; updateData.current_period_end = renewsAt; }
         if (resumePlan) updateData.plan = resumePlan;
         await supabase.from('users').update(updateData).eq('id', user.id);
         console.log(`subscription_updated → synced active for ${userEmail}, plan: ${resumePlan}, renews: ${renewsAt}`);
@@ -919,10 +929,65 @@ app.post('/api/cancel-subscription', async (req, res) => {
     if (!getRes.ok) {
       const lsError = getJson.errors?.[0]?.detail || getJson.message || 'Subscription not found in LS';
       console.error(`LS GET subscription error (${user.subscription_id}):`, lsError);
-      // If 404 — subscription doesn't exist in LS anymore, mark as expired but keep subscription_id
+
       if (getRes.status === 404) {
-        await supabase.from('users').update({ plan: null, subscription_status: 'expired', renews_at: null, current_period_end: null }).eq('id', authUser.id);
-        return res.json({ ok: true, note: 'Subscription not found in LS — marked expired' });
+        // subscription_id in DB is stale/wrong — try to find the real subscription by email
+        console.log(`Subscription ${user.subscription_id} not found in LS, recovering by email for ${authUser.email}`);
+        try {
+          const recoverRes = await fetch(
+            `https://api.lemonsqueezy.com/v1/subscriptions?filter[user_email]=${encodeURIComponent(authUser.email)}&filter[store_id]=${process.env.LS_STORE_ID}`,
+            { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/vnd.api+json' } }
+          );
+          const recoverList = await recoverRes.json().catch(() => ({}));
+          const realSub = recoverList.data?.find(s =>
+            ['active', 'on_trial', 'cancelled'].includes(s.attributes?.status)
+          );
+          if (realSub) {
+            console.log(`Recovered real subscription ${realSub.id} for ${authUser.email} — fixing DB`);
+            await supabase.from('users').update({ subscription_id: realSub.id }).eq('id', authUser.id);
+            user.subscription_id = realSub.id;
+            // Re-fetch the correct subscription and fall through to normal cancel logic
+            const retryRes = await fetch(
+              `https://api.lemonsqueezy.com/v1/subscriptions/${realSub.id}`,
+              { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/vnd.api+json' } }
+            );
+            const retryJson = await retryRes.json().catch(() => ({}));
+            if (retryRes.ok) {
+              // Replace the failed response data and continue normal processing
+              Object.assign(getJson, retryJson);
+              // Fall through with corrected data
+              const lsAttrsR = retryJson.data?.attributes || {};
+              const lsStatusR = lsAttrsR.status;
+              const periodEndR = lsAttrsR.ends_at || lsAttrsR.renews_at || null;
+              console.log(`Retry GET: sub ${realSub.id} status=${lsStatusR}, ends=${periodEndR}`);
+              if (lsStatusR === 'cancelled') {
+                await supabase.from('users').update({ subscription_status: 'cancelled', current_period_end: periodEndR }).eq('id', authUser.id);
+                return res.json({ ok: true });
+              }
+              if (lsStatusR === 'expired') {
+                await supabase.from('users').update({ subscription_status: 'expired', plan: null, renews_at: null, current_period_end: null }).eq('id', authUser.id);
+                return res.json({ ok: true });
+              }
+              // Active — proceed to DELETE below using updated user.subscription_id
+              const delR = await fetch(`https://api.lemonsqueezy.com/v1/subscriptions/${realSub.id}`, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/vnd.api+json' },
+              });
+              if (!delR.ok) {
+                const delJ = await delR.json().catch(() => ({}));
+                return res.status(502).json({ error: delJ.errors?.[0]?.detail || 'Could not cancel subscription' });
+              }
+              const upd = { subscription_status: 'cancelled', subscription_id: realSub.id, current_period_end: periodEndR };
+              if (user.plan) upd.plan = user.plan;
+              await supabase.from('users').update(upd).eq('id', authUser.id);
+              return res.json({ ok: true });
+            }
+          }
+        } catch (recoverErr) {
+          console.error('Recovery attempt failed:', recoverErr.message);
+        }
+        // Truly not found — return error WITHOUT modifying DB (don't wipe plan/status)
+        return res.status(404).json({ error: 'No active subscription found. Please contact support.' });
       }
       return res.status(502).json({ error: lsError });
     }
@@ -972,11 +1037,14 @@ app.post('/api/cancel-subscription', async (req, res) => {
 
     // Immediately update DB — don't wait for webhook (avoids race condition on page reload)
     // Explicitly keep subscription_id so Resume button stays visible
-    await supabase.from('users').update({
+    // Preserve plan so the UI can display "Cancelled — Pro plan" correctly
+    const updatePayload = {
       subscription_status: 'cancelled',
       subscription_id: user.subscription_id,
       current_period_end: periodEnd,
-    }).eq('id', authUser.id);
+    };
+    if (user.plan) updatePayload.plan = user.plan; // keep plan so UI stays accurate
+    await supabase.from('users').update(updatePayload).eq('id', authUser.id);
 
     console.log(`Subscription ${user.subscription_id} cancellation scheduled for ${authUser.email}, access until ${periodEnd}`);
     res.json({ ok: true });
