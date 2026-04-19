@@ -238,15 +238,18 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
     return res.json({ ok: true, credits_added: planInfo.credits });
   }
   if (eventName === 'subscription_cancelled') {
-    const user = await findUser('id, subscription_id, current_period_end');
-    if (user && user.subscription_id === subscriptionId) {
-      // Keep plan + period_end intact — user retains access until period ends.
-      // subscription_expired will fire when access truly ends.
-      const updateData = { subscription_status: 'cancelled' };
-      // Update current_period_end from webhook if provided (more reliable than our DB value)
+    const user = await findUser('id, subscription_id, plan, current_period_end');
+    // Accept if subscription matches OR if subscription_id was cleared (restore it)
+    if (user && (user.subscription_id === subscriptionId || !user.subscription_id)) {
+      const updateData = {
+        subscription_status: 'cancelled',
+        subscription_id: subscriptionId, // always restore from webhook payload
+      };
       if (renewsAt) updateData.current_period_end = renewsAt;
+      // Restore plan from webhook if it was cleared
+      if (planInfo?.plan) updateData.plan = planInfo.plan;
       await supabase.from('users').update(updateData).eq('id', user.id);
-      console.log(`Sub ${subscriptionId} marked cancelled for ${userEmail} — access until ${renewsAt || user.current_period_end}`);
+      console.log(`Sub ${subscriptionId} cancelled for ${userEmail} — plan: ${planInfo?.plan}, access until ${renewsAt}`);
     } else if (user) {
       console.log(`Ignoring subscription_cancelled for old sub ${subscriptionId} — active: ${user.subscription_id}`);
     }
@@ -255,15 +258,16 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
 
   if (eventName === 'subscription_expired') {
     const user = await findUser('id, subscription_id');
-    if (user && user.subscription_id === subscriptionId) {
+    if (user && (user.subscription_id === subscriptionId || !user.subscription_id)) {
       // Period ended — remove Pro privileges but KEEP subscription_id (needed for resume)
       await supabase.from('users').update({
         plan: null,
         subscription_status: 'expired',
+        subscription_id: subscriptionId, // restore from webhook if it was cleared
         renews_at: null,
         current_period_end: null,
       }).eq('id', user.id);
-      console.log(`Sub ${subscriptionId} expired for ${userEmail} — plan cleared, sub_id kept for resume`);
+      console.log(`Sub ${subscriptionId} expired for ${userEmail} — plan cleared, sub_id kept`);
     } else if (user) {
       console.log(`Ignoring subscription_expired for old sub ${subscriptionId} — active: ${user.subscription_id}`);
     }
