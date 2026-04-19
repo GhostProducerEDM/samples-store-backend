@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -118,6 +118,32 @@ async function fetchAll(buildQuery) {
   return { data: all, error: null };
 }
 
+// ── Subscription access helpers ───────────────────────────────────────────────
+// canUserDownload: can the user spend a credit to download?
+// → YES for active/cancelled-in-period (Pro credits)
+// → YES for cancelled-past-period and expired (credit-only, no Pro gate)
+// → NO only if credits are 0
+function canUserDownload(user) {
+  const credits = user.credits ?? 0;
+  if (credits <= 0) return false;
+  return true; // if they have credits, they can always download
+}
+
+// hasProAccess: does user get Pro features (monthly credit refresh, collections, etc.)?
+// → active: yes
+// → cancelled within billing period: yes (paid for it)
+// → cancelled past billing period / expired: no
+function hasProAccess(user) {
+  const status = user.subscription_status;
+  const periodEnd = user.current_period_end ? new Date(user.current_period_end) : null;
+  const now = new Date();
+  if (status === 'active') return true;
+  if (status === 'cancelled') return periodEnd ? periodEnd > now : false;
+  if (status === 'expired') return false;
+  // legacy fallback (no subscription_status column yet)
+  return !!(user.plan && (!user.renews_at || new Date(user.renews_at) > now));
+}
+
 // ===== WEBHOOK Lemon Squeezy =====
 app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   const secret = process.env.LEMONSQUEEZY_SECRET;
@@ -135,7 +161,8 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   const subscriptionId = String(payload.data?.id || '');
   const renewsAt = attrs?.renews_at || attrs?.ends_at || null;
 
-  console.log(`Webhook: ${eventName} | ${userEmail} | variant: ${variantId} | custom_user_id: ${customUserId}`);
+  console.log(`Webhook: ${eventName} | ${userEmail} | variant: ${variantId} | sub_id: ${subscriptionId} | custom_user_id: ${customUserId}`);
+  console.log(`Webhook env variants — starter:${process.env.LS_VARIANT_STARTER} pro:${process.env.LS_VARIANT_PRO} unlimited:${process.env.LS_VARIANT_UNLIMITED}`);
 
   // Helper: find user by custom_data.user_id first, fall back to email
   async function findUser(selectFields = 'id, credits') {
@@ -149,8 +176,36 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
 
   const planInfo = PLAN_CREDITS[variantId];
 
+  // subscription_payment_success fires on every successful renewal billing cycle
+  if (eventName === 'subscription_payment_success') {
+    if (!planInfo) {
+      console.warn(`⚠️  subscription_payment_success: variant ${variantId} not mapped. Skipping.`);
+      return res.json({ ok: true, skipped: true });
+    }
+    const user = await findUser('id, credits');
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    await supabase.from('users').update({
+      credits: user.credits + planInfo.credits,
+      plan: planInfo.plan,
+      subscription_status: 'active',
+      subscription_id: subscriptionId,
+      renews_at: renewsAt,
+      current_period_end: renewsAt,
+    }).eq('id', user.id);
+    await supabase.from('subscriptions').insert({
+      user_id: user.id,
+      plan: planInfo.plan,
+      credits_added: planInfo.credits,
+    });
+    console.log(`+${planInfo.credits} credits (renewal) → ${userEmail}`);
+    return res.json({ ok: true, credits_added: planInfo.credits });
+  }
+
   if (eventName === 'subscription_created' || eventName === 'subscription_renewed') {
-    if (!planInfo) return res.json({ ok: true, skipped: true });
+    if (!planInfo) {
+      console.warn(`⚠️  No plan found for variant ${variantId} — check LS_VARIANT_* env vars. Skipping credits.`);
+      return res.json({ ok: true, skipped: true, reason: `variant ${variantId} not mapped` });
+    }
     const user = await findUser('id, credits, subscription_id');
     if (!user) return res.status(404).json({ error: 'User not found' });
     // Cancel previous subscription on upgrade (subscription_created only)
@@ -168,8 +223,10 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
     await supabase.from('users').update({
       credits: user.credits + planInfo.credits,
       plan: planInfo.plan,
+      subscription_status: 'active',
       subscription_id: subscriptionId,
       renews_at: renewsAt,
+      current_period_end: renewsAt,
     }).eq('id', user.id);
     // Record subscription payment in history
     await supabase.from('subscriptions').insert({
@@ -180,9 +237,36 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
     console.log(`+${planInfo.credits} credits → ${userEmail}`);
     return res.json({ ok: true, credits_added: planInfo.credits });
   }
-  if (eventName === 'subscription_cancelled' || eventName === 'subscription_expired') {
-    const user = await findUser('id');
-    if (user) await supabase.from('users').update({ plan: null, subscription_id: null, renews_at: null }).eq('id', user.id);
+  if (eventName === 'subscription_cancelled') {
+    const user = await findUser('id, subscription_id, current_period_end');
+    if (user && user.subscription_id === subscriptionId) {
+      // Keep plan + period_end intact — user retains access until period ends.
+      // subscription_expired will fire when access truly ends.
+      const updateData = { subscription_status: 'cancelled' };
+      // Update current_period_end from webhook if provided (more reliable than our DB value)
+      if (renewsAt) updateData.current_period_end = renewsAt;
+      await supabase.from('users').update(updateData).eq('id', user.id);
+      console.log(`Sub ${subscriptionId} marked cancelled for ${userEmail} — access until ${renewsAt || user.current_period_end}`);
+    } else if (user) {
+      console.log(`Ignoring subscription_cancelled for old sub ${subscriptionId} — active: ${user.subscription_id}`);
+    }
+    return res.json({ ok: true });
+  }
+
+  if (eventName === 'subscription_expired') {
+    const user = await findUser('id, subscription_id');
+    if (user && user.subscription_id === subscriptionId) {
+      // Period ended — remove Pro privileges but KEEP subscription_id (needed for resume)
+      await supabase.from('users').update({
+        plan: null,
+        subscription_status: 'expired',
+        renews_at: null,
+        current_period_end: null,
+      }).eq('id', user.id);
+      console.log(`Sub ${subscriptionId} expired for ${userEmail} — plan cleared, sub_id kept for resume`);
+    } else if (user) {
+      console.log(`Ignoring subscription_expired for old sub ${subscriptionId} — active: ${user.subscription_id}`);
+    }
     return res.json({ ok: true });
   }
   // ===== ONE-TIME ORDER (credit packs + pack purchases) =====
@@ -247,6 +331,58 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
     return res.json({ ok: true, pack: packProduct.pack_name, bonus_credits: packProduct.bonus_credits });
   }
 
+  if (eventName === 'subscription_resumed') {
+    const user = await findUser('id, subscription_id');
+    if (user) {
+      // Accept resume even if subscription_id was cleared (e.g. old cancel logic wiped it)
+      const resumePlan = planInfo?.plan || null;
+      const updateData = {
+        subscription_status: 'active',
+        subscription_id: subscriptionId,
+        renews_at: renewsAt,
+        current_period_end: renewsAt,
+      };
+      if (resumePlan) updateData.plan = resumePlan;
+      await supabase.from('users').update(updateData).eq('id', user.id);
+      console.log(`Sub ${subscriptionId} resumed for ${userEmail} — plan: ${resumePlan}, renews: ${renewsAt}`);
+    }
+    return res.json({ ok: true });
+  }
+
+  // subscription_updated fires for plan changes, resumes, pauses, etc.
+  if (eventName === 'subscription_updated') {
+    const lsStatus = attrs?.status;
+    console.log(`subscription_updated for ${userEmail} — LS status: ${lsStatus}, sub: ${subscriptionId}`);
+
+    if (lsStatus === 'active' || lsStatus === 'on_trial') {
+      // Always sync on active — covers resume, plan change, billing date update
+      const user = await findUser('id, subscription_status');
+      if (user) {
+        const resumePlan = planInfo?.plan || null;
+        const updateData = {
+          subscription_status: 'active',
+          subscription_id: subscriptionId,
+          renews_at: renewsAt,
+          current_period_end: renewsAt,
+        };
+        if (resumePlan) updateData.plan = resumePlan;
+        await supabase.from('users').update(updateData).eq('id', user.id);
+        console.log(`subscription_updated → synced active for ${userEmail}, plan: ${resumePlan}, renews: ${renewsAt}`);
+      }
+    } else if (lsStatus === 'cancelled') {
+      // Also handle cancel via subscription_updated (some LS versions send this instead of subscription_cancelled)
+      const user = await findUser('id, subscription_id');
+      if (user && user.subscription_id === subscriptionId) {
+        const updateData = { subscription_status: 'cancelled' };
+        if (renewsAt) updateData.current_period_end = renewsAt;
+        await supabase.from('users').update(updateData).eq('id', user.id);
+        console.log(`subscription_updated → cancel synced for ${userEmail}`);
+      }
+    }
+    return res.json({ ok: true });
+  }
+
+  console.log(`Unhandled webhook event: ${eventName}`);
   res.json({ ok: true, skipped: true });
 });
 
@@ -263,8 +399,86 @@ app.post('/api/ensure-user', async (req, res) => {
 app.get('/api/profile', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
-  const { data } = await supabase.from('users').select('credits, plan, renews_at, email').eq('id', authUser.id).single();
+  const { data } = await supabase
+    .from('users')
+    .select('credits, plan, subscription_status, subscription_id, current_period_end, renews_at, email, nickname, avatar_url, bio, website')
+    .eq('id', authUser.id)
+    .single();
   if (!data) return res.status(404).json({ error: 'User not found' });
+  res.json(data);
+});
+
+app.put('/api/profile', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { nickname, bio, website, avatar_url } = req.body;
+  const updates = {};
+
+  // ── nickname ──
+  if (nickname !== undefined) {
+    const nick = nickname.trim();
+    if (!/^[a-zA-Z0-9_\-]{3,30}$/.test(nick))
+      return res.status(400).json({ error: 'Nickname must be 3–30 characters: letters, numbers, _ or -' });
+
+    // uniqueness check
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .ilike('nickname', nick)
+      .neq('id', authUser.id)
+      .maybeSingle();
+    if (existing) return res.status(409).json({ error: 'That nickname is already taken' });
+
+    updates.nickname = nick;
+  }
+
+  // ── bio ──
+  if (bio !== undefined) {
+    if (bio.length > 200) return res.status(400).json({ error: 'Bio must be 200 characters or less' });
+    updates.bio = bio.trim();
+  }
+
+  // ── website ──
+  if (website !== undefined) {
+    const ws = website.trim();
+    if (ws && !/^https?:\/\/.+/.test(ws))
+      return res.status(400).json({ error: 'Website must start with http:// or https://' });
+    updates.website = ws || null;
+  }
+
+  // ── avatar_url ──
+  if (avatar_url !== undefined) {
+    const av = avatar_url.trim();
+    if (av && !/^https?:\/\/.+/.test(av))
+      return res.status(400).json({ error: 'Avatar URL must start with http:// or https://' });
+    updates.avatar_url = av || null;
+  }
+
+  if (Object.keys(updates).length === 0)
+    return res.status(400).json({ error: 'Nothing to update' });
+
+  const { data, error } = await supabase
+    .from('users')
+    .update(updates)
+    .eq('id', authUser.id)
+    .select('nickname, avatar_url, bio, website')
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Sync author_name in community wisdom posts + comments when nickname changes
+  if (updates.nickname && authUser.email) {
+    await Promise.allSettled([
+      supabase.schema('community_wisdom').from('ideas')
+        .update({ author_name: updates.nickname })
+        .eq('author_email', authUser.email),
+      supabase.schema('community_wisdom').from('comments')
+        .update({ author_name: updates.nickname })
+        .eq('author_email', authUser.email),
+    ]);
+  }
+
   res.json(data);
 });
 
@@ -542,11 +756,9 @@ app.post('/api/download', async (req, res) => {
   const authUser = await getUserFromToken(req);
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { sampleId } = req.body;
-  const { data: user } = await supabase.from('users').select('credits, plan, renews_at').eq('id', authUser.id).single();
+  const { data: user } = await supabase.from('users').select('credits, plan, subscription_status, current_period_end, renews_at').eq('id', authUser.id).single();
   if (!user) return res.status(400).json({ error: 'User not found' });
-  // Subscription must be active to spend credits
-  const hasActivePlan = user.plan && (!user.renews_at || new Date(user.renews_at) > new Date());
-  if (!hasActivePlan) return res.status(403).json({ error: 'Active subscription required to download' });
+  if (!canUserDownload(user)) return res.status(403).json({ error: 'Active subscription required to download' });
   const { data: sample } = await supabase.from('samples').select('id, url').eq('id', sampleId).single();
   if (!sample) return res.status(400).json({ error: 'Sample not found' });
   const { data: existing } = await supabase.from('user_downloads').select('id')
@@ -619,6 +831,205 @@ app.post('/api/create-checkout', async (req, res) => {
     res.json({ url });
   } catch (e) {
     console.error('create-checkout error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== BILLING PORTAL (Lemon Squeezy Customer Portal) =====
+app.get('/api/billing-portal', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data: user } = await supabase
+    .from('users').select('subscription_id').eq('id', authUser.id).single();
+
+  if (!user?.subscription_id)
+    return res.status(404).json({ error: 'No active subscription found' });
+
+  const apiKey = process.env.LEMONSQUEEZY_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'LS not configured' });
+
+  try {
+    const lsRes = await fetch(
+      `https://api.lemonsqueezy.com/v1/subscriptions/${user.subscription_id}`,
+      { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/vnd.api+json' } }
+    );
+    const json = await lsRes.json();
+    if (!lsRes.ok) {
+      console.error('LS billing-portal error:', JSON.stringify(json));
+      return res.status(502).json({ error: 'Could not retrieve portal URL' });
+    }
+    const portalUrl = json.data?.attributes?.urls?.customer_portal;
+    if (!portalUrl) return res.status(502).json({ error: 'Portal URL unavailable' });
+    res.json({ url: portalUrl });
+  } catch (e) {
+    console.error('billing-portal error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== CANCEL SUBSCRIPTION =====
+app.post('/api/cancel-subscription', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data: user } = await supabase
+    .from('users').select('subscription_id, plan, subscription_status').eq('id', authUser.id).single();
+
+  console.log(`cancel-subscription: user=${authUser.email} sub_id=${user?.subscription_id} status=${user?.subscription_status} plan=${user?.plan}`);
+
+  const apiKey = process.env.LEMONSQUEEZY_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'LS not configured' });
+
+  // If subscription_id missing in DB but user has a plan — try to find sub in LS by store
+  if (!user?.subscription_id) {
+    // Try to recover subscription_id from LS
+    try {
+      const lsListRes = await fetch(
+        `https://api.lemonsqueezy.com/v1/subscriptions?filter[user_email]=${encodeURIComponent(authUser.email)}&filter[store_id]=${process.env.LS_STORE_ID}`,
+        { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/vnd.api+json' } }
+      );
+      const lsList = await lsListRes.json().catch(() => ({}));
+      const activeSub = lsList.data?.find(s => ['active', 'on_trial', 'cancelled'].includes(s.attributes?.status));
+      if (activeSub) {
+        // Restore subscription_id in DB
+        await supabase.from('users').update({ subscription_id: activeSub.id }).eq('id', authUser.id);
+        user.subscription_id = activeSub.id;
+        console.log(`Recovered subscription_id ${activeSub.id} for ${authUser.email}`);
+      } else {
+        return res.status(404).json({ error: 'No active subscription found' });
+      }
+    } catch (e) {
+      return res.status(404).json({ error: 'No active subscription found' });
+    }
+  }
+
+  try {
+    // First GET the subscription to check its current status
+    const getRes = await fetch(
+      `https://api.lemonsqueezy.com/v1/subscriptions/${user.subscription_id}`,
+      { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/vnd.api+json' } }
+    );
+    const getJson = await getRes.json().catch(() => ({}));
+
+    if (!getRes.ok) {
+      const lsError = getJson.errors?.[0]?.detail || getJson.message || 'Subscription not found in LS';
+      console.error(`LS GET subscription error (${user.subscription_id}):`, lsError);
+      // If 404 — subscription doesn't exist in LS anymore, mark as expired but keep subscription_id
+      if (getRes.status === 404) {
+        await supabase.from('users').update({ plan: null, subscription_status: 'expired', renews_at: null, current_period_end: null }).eq('id', authUser.id);
+        return res.json({ ok: true, note: 'Subscription not found in LS — marked expired' });
+      }
+      return res.status(502).json({ error: lsError });
+    }
+
+    const lsAttrs = getJson.data?.attributes || {};
+    const lsStatus = lsAttrs.status;
+    // renews_at or ends_at tells us when access actually expires
+    const periodEnd = lsAttrs.ends_at || lsAttrs.renews_at || null;
+    console.log(`LS subscription ${user.subscription_id} status: ${lsStatus}, ends: ${periodEnd}`);
+
+    // Already cancelled in LS — sync our DB to match (keep subscription_id for resume)
+    if (lsStatus === 'cancelled') {
+      await supabase.from('users').update({
+        subscription_status: 'cancelled',
+        current_period_end: periodEnd,
+      }).eq('id', authUser.id);
+      console.log(`Subscription already cancelled in LS — synced DB for ${authUser.email}`);
+      return res.json({ ok: true });
+    }
+
+    // Expired in LS — mark as expired, clear plan but KEEP subscription_id for resume
+    if (lsStatus === 'expired') {
+      await supabase.from('users').update({
+        subscription_status: 'expired',
+        plan: null,
+        renews_at: null,
+        current_period_end: null,
+      }).eq('id', authUser.id);
+      console.log(`Subscription expired in LS — plan cleared, sub_id kept for ${authUser.email}`);
+      return res.json({ ok: true });
+    }
+
+    // Active/on_trial — DELETE to schedule cancellation at end of billing period
+    const delRes = await fetch(
+      `https://api.lemonsqueezy.com/v1/subscriptions/${user.subscription_id}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/vnd.api+json' },
+      }
+    );
+    if (!delRes.ok) {
+      const delJson = await delRes.json().catch(() => ({}));
+      const lsError = delJson.errors?.[0]?.detail || delJson.message || 'Could not cancel subscription';
+      console.error(`LS DELETE subscription error (${user.subscription_id}):`, JSON.stringify(delJson));
+      return res.status(502).json({ error: lsError });
+    }
+
+    // Immediately update DB — don't wait for webhook (avoids race condition on page reload)
+    // Explicitly keep subscription_id so Resume button stays visible
+    await supabase.from('users').update({
+      subscription_status: 'cancelled',
+      subscription_id: user.subscription_id,
+      current_period_end: periodEnd,
+    }).eq('id', authUser.id);
+
+    console.log(`Subscription ${user.subscription_id} cancellation scheduled for ${authUser.email}, access until ${periodEnd}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('cancel-subscription error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== RESUME SUBSCRIPTION =====
+app.post('/api/resume-subscription', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data: user } = await supabase
+    .from('users').select('subscription_id, subscription_status').eq('id', authUser.id).single();
+
+  if (!user?.subscription_id)
+    return res.status(404).json({ error: 'No subscription found — please contact support.' });
+
+  // Allow resume from cancelled or expired state (or null — legacy accounts)
+  if (user.subscription_status === 'active')
+    return res.status(400).json({ error: 'Subscription is already active.' });
+
+  const apiKey = process.env.LEMONSQUEEZY_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'LS not configured' });
+
+  try {
+    const lsRes = await fetch(
+      `https://api.lemonsqueezy.com/v1/subscriptions/${user.subscription_id}`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: 'application/vnd.api+json',
+          'Content-Type': 'application/vnd.api+json',
+        },
+        body: JSON.stringify({
+          data: {
+            type: 'subscriptions',
+            id: String(user.subscription_id),
+            attributes: { cancelled: false },
+          },
+        }),
+      }
+    );
+    if (!lsRes.ok) {
+      const json = await lsRes.json().catch(() => ({}));
+      const lsError = json.errors?.[0]?.detail || 'Could not resume subscription';
+      console.error('LS resume-subscription error:', JSON.stringify(json));
+      return res.status(502).json({ error: lsError });
+    }
+    await supabase.from('users').update({ subscription_status: 'active' }).eq('id', authUser.id);
+    console.log(`Subscription ${user.subscription_id} resumed for ${authUser.email}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('resume-subscription error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1164,12 +1575,11 @@ app.post('/api/collections/:slug/download', async (req, res) => {
 
     if (!existing) {
       const { data: user } = await supabase
-        .from('users').select('credits, plan, renews_at')
+        .from('users').select('credits, plan, subscription_status, current_period_end, renews_at')
         .eq('id', authUser.id).single();
       if (!user) return res.status(404).json({ error: 'User not found' });
 
-      const hasActivePlan = user.plan && (!user.renews_at || new Date(user.renews_at) > new Date());
-      if (!hasActivePlan) return res.status(403).json({ error: 'Active subscription required' });
+      if (!canUserDownload(user)) return res.status(403).json({ error: 'Active subscription required' });
 
       const cost = collection.price_credits;
       if (user.credits < cost) return res.status(400).json({ error: 'No credits' });
@@ -1647,6 +2057,173 @@ app.get('/api/download-library-zip', async (req, res) => {
   zip.generateNodeStream({ type: 'nodebuffer', streamFiles: true })
     .pipe(res)
     .on('error', err => { console.error('ZIP stream error:', err); res.end(); });
+});
+
+// ===== PRESET PREVIEW PROXY =====
+app.get('/api/preset-preview/:id', async (req, res) => {
+  if (!isValidPreviewToken(req.query.t, getClientIp(req))) return res.status(403).end();
+  try {
+    const { data: preset, error } = await supabase
+      .from('presets').select('preview_url').eq('id', req.params.id).single();
+    if (error || !preset?.preview_url) return res.status(404).end();
+
+    const upHeaders = { 'User-Agent': 'Mozilla/5.0' };
+    if (req.headers['range']) upHeaders['Range'] = req.headers['range'];
+
+    const upstream = await nodeFetch(signBunnyUrl(preset.preview_url, 300), { headers: upHeaders });
+    res.status(upstream.status);
+    for (const h of ['content-type','content-length','content-range','accept-ranges']) {
+      const v = upstream.headers.get(h); if (v) res.setHeader(h, v);
+    }
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    upstream.body.pipe(res).on('error', () => res.end());
+  } catch(e) { res.status(500).end(); }
+});
+
+// ===== PRESET LIKES =====
+app.get('/api/preset-likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const uc = await userClient(req);
+  const { data, error } = await uc.from('preset_likes')
+    .select('preset_id, liked_at').eq('user_id', authUser.id)
+    .order('liked_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post('/api/preset-likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const presetId = req.body.presetId ?? req.body.preset_id;
+  if (!presetId) return res.status(400).json({ error: 'presetId required' });
+  const uc = await userClient(req);
+  const { error } = await uc.from('preset_likes')
+    .upsert({ user_id: authUser.id, preset_id: presetId }, { onConflict: 'user_id,preset_id' });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.delete('/api/preset-likes', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const presetId = req.body.presetId ?? req.body.preset_id;
+  if (!presetId) return res.status(400).json({ error: 'presetId required' });
+  const uc = await userClient(req);
+  const { error } = await uc.from('preset_likes')
+    .delete().eq('user_id', authUser.id).eq('preset_id', presetId);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// ===== PRESET DOWNLOADS =====
+app.get('/api/preset-downloads', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const uc = await userClient(req);
+  const { data, error } = await uc.from('preset_downloads')
+    .select('preset_id, downloaded_at').eq('user_id', authUser.id)
+    .order('downloaded_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post('/api/preset-download', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
+  const { presetId } = req.body;
+  if (!presetId) return res.status(400).json({ error: 'presetId required' });
+  const { data: user } = await supabase.from('users')
+    .select('credits, plan, subscription_status, current_period_end, renews_at').eq('id', authUser.id).single();
+  if (!user) return res.status(400).json({ error: 'User not found' });
+  if (!canUserDownload(user)) return res.status(403).json({ error: 'Active subscription required to download' });
+  const { data: preset } = await supabase.from('presets')
+    .select('id, file_url').eq('id', presetId).single();
+  if (!preset) return res.status(400).json({ error: 'Preset not found' });
+  // Use userClient so RLS auth.uid() resolves correctly for preset_downloads
+  const uc = await userClient(req);
+  const { data: existing } = await uc.from('preset_downloads').select('id')
+    .eq('user_id', authUser.id).eq('preset_id', presetId).single();
+  if (existing) return res.json({ url: signBunnyUrl(preset.file_url) });
+  if (user.credits <= 0) return res.status(400).json({ error: 'No credits' });
+  await supabase.from('users').update({ credits: user.credits - 1 }).eq('id', authUser.id);
+  const { error: insertErr } = await uc.from('preset_downloads')
+    .insert({ user_id: authUser.id, preset_id: presetId });
+  if (insertErr) {
+    // Roll back credit deduction so user isn't charged for a failed record
+    await supabase.from('users').update({ credits: user.credits }).eq('id', authUser.id);
+    return res.status(500).json({ error: 'Failed to record download' });
+  }
+  res.json({ url: signBunnyUrl(preset.file_url) });
+});
+
+// ===== PRESET PLAYS =====
+app.post('/api/preset-plays', async (req, res) => {
+  const authUser = await getUserFromToken(req);
+  const { presetId, referrer, page, sessionId } = req.body;
+  if (!presetId) return res.status(400).json({ error: 'presetId required' });
+  const ip = (req.headers['cf-connecting-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0] || req.ip || '').trim() || null;
+  const country = req.headers['cf-ipcountry'] || null;
+  const userAgent = (req.headers['user-agent'] || '').slice(0, 512) || null;
+  await supabase.from('preset_plays').insert({
+    user_id: authUser?.id || null, preset_id: presetId,
+    session_id: sessionId || null, referrer: referrer ? referrer.slice(0, 512) : null,
+    page: page || null, ip, country, user_agent: userAgent,
+  });
+  try { await supabase.rpc('increment_preset_play_count', { preset_id: presetId }); } catch(e) {}
+  res.json({ ok: true });
+});
+
+// ===== ADMIN PRESETS =====
+app.get('/api/admin/presets', requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 30, search, vst } = req.query;
+    const lim = Math.min(100, Math.max(1, parseInt(limit)));
+    const from = (Math.max(1, parseInt(page)) - 1) * lim;
+    const to = from + lim - 1;
+    let q = supabase.from('presets')
+      .select('id, name, vst, preview_url, file_url, cover, play_count, created_at', { count: 'exact' });
+    if (search) q = q.or(`name.ilike.%${search}%,vst.ilike.%${search}%`);
+    if (vst) q = q.eq('vst', vst);
+    q = q.order('created_at', { ascending: false }).range(from, to);
+    const { data, count, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ presets: data || [], total: count || 0, page: parseInt(page), pages: Math.ceil((count || 0) / lim) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/presets', requireAdmin, async (req, res) => {
+  try {
+    const { name, vst, preview_url, file_url, cover } = req.body;
+    if (!name || !vst) return res.status(400).json({ error: 'name and vst required' });
+    const { data, error } = await supabase.from('presets')
+      .insert({ name, vst, preview_url: preview_url || null, file_url: file_url || null, cover: cover || null })
+      .select('id').single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, id: data.id });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/admin/presets/:id', requireAdmin, async (req, res) => {
+  try {
+    const { name, vst, preview_url, file_url, cover } = req.body;
+    const { error } = await supabase.from('presets')
+      .update({ name, vst, preview_url: preview_url || null, file_url: file_url || null, cover: cover || null })
+      .eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/presets/:id', requireAdmin, async (req, res) => {
+  try {
+    await supabase.from('preset_downloads').delete().eq('preset_id', req.params.id);
+    await supabase.from('preset_likes').delete().eq('preset_id', req.params.id);
+    await supabase.from('preset_plays').delete().eq('preset_id', req.params.id);
+    const { error } = await supabase.from('presets').delete().eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ===== START =====
