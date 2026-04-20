@@ -406,17 +406,54 @@ app.post('/api/webhook/lemonsqueezy', async (req, res) => {
   if (eventName === 'subscription_updated') {
     const lsStatus = attrs?.status;
     if (lsStatus === 'active' || lsStatus === 'on_trial') {
-      const user = await findUser('id, subscription_status, plan');
+      const user = await findUser('id, subscription_status, plan, credits');
       if (user) {
-        const resumePlan = planInfo?.plan || user.plan || null;
+        const newPlan = planInfo?.plan || null;   // plan from new variant_id (may be null if not mapped)
+        const oldPlan = user.plan || null;
+        const effectivePlan = newPlan || oldPlan || null;
+
         const upd = { subscription_status: 'active', subscription_id: subscriptionId };
-        if (renewsAt)    { upd.renews_at = renewsAt; upd.current_period_end = renewsAt; }
-        if (resumePlan)    upd.plan    = resumePlan;
-        if (userCountry)   upd.country = userCountry;
-        if (userCity)      upd.city    = userCity;
+        if (renewsAt)       { upd.renews_at = renewsAt; upd.current_period_end = renewsAt; }
+        if (effectivePlan)    upd.plan    = effectivePlan;
+        if (userCountry)      upd.country = userCountry;
+        if (userCity)         upd.city    = userCity;
+
+        // ── Plan-change credit diff (upgrade only) ──────────────────────────
+        // Upgrade: add the credit difference immediately, idempotent.
+        // Downgrade: no deduction — user keeps credits; new amount credited on next payment_success.
+        if (newPlan && oldPlan && newPlan !== oldPlan) {
+          const CREDITS_MAP = { starter: 100, pro: 350, unlimited: 1000 };
+          const newCredits = CREDITS_MAP[newPlan] ?? 0;
+          const oldCredits = CREDITS_MAP[oldPlan] ?? 0;
+          const creditDiff = newCredits - oldCredits;
+
+          if (creditDiff > 0) {
+            // Upgrade — add the diff now, idempotent via webhook_logs
+            const idemKey = `pc:${subscriptionId}:${newPlan}`;
+            if (await alreadyProcessed(idemKey)) {
+              console.log(`[webhook] plan upgrade credit diff already applied — ${idemKey}`);
+              await log('skipped', `upgrade credit diff already applied (${oldPlan}→${newPlan})`, idemKey);
+            } else {
+              const newBalance = await supabase.rpc('add_credits', { p_user_id: user.id, p_amount: creditDiff });
+              await supabase.from('subscriptions').insert({
+                user_id: user.id, plan: newPlan, credits_added: creditDiff,
+              });
+              await log('success', `plan upgrade ${oldPlan}→${newPlan}: +${creditDiff} credits (diff)`, idemKey);
+              console.log(`[webhook] plan upgrade ${oldPlan}→${newPlan}: +${creditDiff} credits → ${userEmail}`);
+            }
+          } else {
+            // Downgrade — just note it; credits flow naturally on next renewal
+            await log('success', `plan downgrade ${oldPlan}→${newPlan}: no credit deduction, next renewal will credit ${newCredits}`);
+            console.log(`[webhook] plan downgrade ${oldPlan}→${newPlan} for ${userEmail}`);
+          }
+        }
+
         await supabase.from('users').update(upd).eq('id', user.id);
-        await log('success', `synced active — plan: ${resumePlan}`);
-        console.log(`[webhook] subscription_updated → active for ${userEmail}, plan: ${resumePlan}`);
+        if (!newPlan || !oldPlan || newPlan === oldPlan) {
+          // Only log generic "synced" if we didn't already log a plan-change event above
+          await log('success', `synced active — plan: ${effectivePlan}`);
+        }
+        console.log(`[webhook] subscription_updated → active for ${userEmail}, plan: ${effectivePlan}`);
       } else {
         await log('error', 'user not found');
       }
@@ -1855,7 +1892,7 @@ app.post('/api/collections/:slug/download', async (req, res) => {
 });
 
 // ===== HEALTH CHECK =====
-app.get('/', (req, res) => res.json({ status: 'ok', version: '4.1', features: ['webhook_logs', 'idempotency', 'past_due'] }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '4.2', features: ['webhook_logs', 'idempotency', 'past_due', 'plan_change'] }));
 
 // ═══════════════════════════════════════════
 // ADMIN API — protected by X-Admin-Key header
