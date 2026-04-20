@@ -64,9 +64,12 @@ app.use((req, res, next) => {
 app.use('/api/webhook/lemonsqueezy', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
+// Backend uses service_role key to bypass RLS for server-side operations.
+// Falls back to anon key for local dev if SERVICE_ROLE_KEY is not set.
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false } }
 );
 
 const PLAN_CREDITS = {
@@ -146,258 +149,370 @@ function hasProAccess(user) {
 
 // ===== WEBHOOK Lemon Squeezy =====
 app.post('/api/webhook/lemonsqueezy', async (req, res) => {
+  // ── 1. HMAC VERIFICATION ───────────────────────────────────────────────────
   const secret = process.env.LEMONSQUEEZY_SECRET;
+  if (!secret) {
+    console.error('LEMONSQUEEZY_SECRET env var not set — rejecting webhook');
+    return res.status(500).json({ error: 'Server misconfiguration' });
+  }
   const signature = req.headers['x-signature'];
+  if (!signature) return res.status(401).json({ error: 'Missing x-signature header' });
+
   const body = req.body;
   const digest = crypto.createHmac('sha256', secret).update(body).digest('hex');
-  if (signature !== digest) return res.status(401).json({ error: 'Invalid signature' });
-
-  const payload = JSON.parse(body.toString());
-  const eventName = payload.meta?.event_name;
-  const attrs = payload.data?.attributes;
-  const variantId = String(attrs?.variant_id || attrs?.first_order_item?.variant_id || '');
-  const userEmail = attrs?.user_email;
-  const customUserId = payload.meta?.custom_data?.user_id || null;
-  const subscriptionId = String(payload.data?.id || '');
-  const renewsAt = attrs?.renews_at || attrs?.ends_at || null;
-
-  console.log(`Webhook: ${eventName} | ${userEmail} | variant: ${variantId} | sub_id: ${subscriptionId} | custom_user_id: ${customUserId}`);
-  console.log(`Webhook env variants — starter:${process.env.LS_VARIANT_STARTER} pro:${process.env.LS_VARIANT_PRO} unlimited:${process.env.LS_VARIANT_UNLIMITED}`);
-
-  // Safety guard: never process a subscription event with an empty/missing subscription ID
-  const isSubEvent = eventName?.startsWith('subscription_');
-  if (isSubEvent && !subscriptionId) {
-    console.warn(`⚠️  ${eventName}: missing subscription ID in payload — skipping to avoid data corruption`);
-    return res.json({ ok: true, skipped: true, reason: 'missing subscription_id' });
+  if (signature !== digest) {
+    console.warn('Webhook HMAC mismatch — possible spoofed request');
+    return res.status(401).json({ error: 'Invalid signature' });
   }
 
-  // Helper: find user by custom_data.user_id first, fall back to email
-  async function findUser(selectFields = 'id, credits') {
+  // ── 2. PARSE PAYLOAD ───────────────────────────────────────────────────────
+  let payload;
+  try { payload = JSON.parse(body.toString()); }
+  catch { return res.status(400).json({ error: 'Invalid JSON' }); }
+
+  const eventName      = payload.meta?.event_name        ?? '';
+  const testMode       = payload.meta?.test_mode          ?? false;
+  const lsEventId      = payload.meta?.event_id           ?? null;   // delivery ID (changes on retry)
+  const attrs          = payload.data?.attributes         ?? {};
+  const variantId      = String(attrs.variant_id || attrs.first_order_item?.variant_id || '');
+  const userEmail      = attrs.user_email                 ?? null;
+  const customUserId   = payload.meta?.custom_data?.user_id ?? null;
+  const subscriptionId = String(payload.data?.id          ?? '');
+  const renewsAt       = attrs.renews_at || attrs.ends_at || null;
+  const userCountry    = attrs.user_country               ?? null;
+  const userCity       = attrs.billing_address?.city      ?? null;
+
+  console.log(`[webhook] ${testMode ? '[TEST] ' : ''}${eventName} | ${userEmail} | sub:${subscriptionId} | uid:${customUserId}`);
+
+  // ── 3. HELPERS ─────────────────────────────────────────────────────────────
+
+  // Find user: prefer custom_data.user_id (set server-side), fall back to email
+  async function findUser(fields = 'id, credits') {
     if (customUserId) {
-      const { data } = await supabase.from('users').select(selectFields).eq('id', customUserId).single();
+      const { data } = await supabase.from('users').select(fields).eq('id', customUserId).single();
       if (data) return data;
+      console.warn(`[webhook] custom_user_id ${customUserId} not found, falling back to email`);
     }
-    const { data } = await supabase.from('users').select(selectFields).eq('email', userEmail).single();
-    return data || null;
+    const { data } = await supabase.from('users').select(fields).eq('email', userEmail).single();
+    return data ?? null;
+  }
+
+  // Write a row to webhook_logs; never throws (logging must not break the handler)
+  async function log(status, notes = null, idempotencyKey = null) {
+    try {
+      await supabase.from('webhook_logs').insert({
+        event_name:      eventName,
+        ls_event_id:     lsEventId,
+        ls_entity_id:    subscriptionId || null,
+        idempotency_key: idempotencyKey,
+        user_email:      userEmail,
+        status,
+        notes,
+        test_mode:       testMode,
+      });
+    } catch (e) {
+      console.error('[webhook] Failed to write webhook_log:', e.message);
+    }
+  }
+
+  // Idempotency check: returns true if we already successfully processed this key
+  async function alreadyProcessed(idempotencyKey) {
+    if (!idempotencyKey) return false;
+    const { data } = await supabase.from('webhook_logs')
+      .select('id')
+      .eq('idempotency_key', idempotencyKey)
+      .eq('status', 'success')
+      .maybeSingle();
+    return !!data;
+  }
+
+  // ── 4. SAFETY GUARD ────────────────────────────────────────────────────────
+  const isSubEvent = eventName.startsWith('subscription_');
+  if (isSubEvent && !subscriptionId) {
+    console.warn(`[webhook] ${eventName}: missing subscription ID — skipping`);
+    await log('ignored', 'missing subscription_id');
+    return res.json({ ok: true, skipped: true, reason: 'missing subscription_id' });
   }
 
   const planInfo = PLAN_CREDITS[variantId];
 
-  // subscription_payment_success fires on every successful renewal billing cycle
+  // ── 5. EVENT HANDLERS ──────────────────────────────────────────────────────
+
+  // ── subscription_payment_success: fires on every successful billing cycle ──
   if (eventName === 'subscription_payment_success') {
     if (!planInfo) {
-      console.warn(`⚠️  subscription_payment_success: variant ${variantId} not mapped. Skipping.`);
+      console.warn(`[webhook] payment_success: variant ${variantId} not mapped — skipping`);
+      await log('ignored', `variant ${variantId} not mapped`);
       return res.json({ ok: true, skipped: true });
     }
+
+    const idemKey = `ps:${subscriptionId}:${renewsAt}`;
+    if (await alreadyProcessed(idemKey)) {
+      console.log(`[webhook] payment_success duplicate skipped — ${idemKey}`);
+      await log('skipped', 'duplicate delivery', idemKey);
+      return res.json({ ok: true, duplicate: true });
+    }
+
     const user = await findUser('id, credits');
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    await supabase.from('users').update({
-      credits: user.credits + planInfo.credits,
-      plan: planInfo.plan,
-      subscription_status: 'active',
-      subscription_id: subscriptionId,
-      renews_at: renewsAt,
-      current_period_end: renewsAt,
-    }).eq('id', user.id);
-    await supabase.from('subscriptions').insert({
-      user_id: user.id,
-      plan: planInfo.plan,
-      credits_added: planInfo.credits,
-    });
-    console.log(`+${planInfo.credits} credits (renewal) → ${userEmail}`);
+    if (!user) {
+      await log('error', 'user not found');
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const upd = {
+      credits: user.credits + planInfo.credits, plan: planInfo.plan,
+      subscription_status: 'active', subscription_id: subscriptionId,
+      renews_at: renewsAt, current_period_end: renewsAt,
+    };
+    if (userCountry) upd.country = userCountry;
+    if (userCity)    upd.city    = userCity;
+    await supabase.from('users').update(upd).eq('id', user.id);
+    await supabase.from('subscriptions').insert({ user_id: user.id, plan: planInfo.plan, credits_added: planInfo.credits });
+    await log('success', `+${planInfo.credits} credits (renewal)`, idemKey);
+    console.log(`[webhook] +${planInfo.credits} credits (renewal) → ${userEmail}`);
     return res.json({ ok: true, credits_added: planInfo.credits });
   }
 
+  // ── subscription_created / subscription_renewed ───────────────────────────
   if (eventName === 'subscription_created' || eventName === 'subscription_renewed') {
     if (!planInfo) {
-      console.warn(`⚠️  No plan found for variant ${variantId} — check LS_VARIANT_* env vars. Skipping credits.`);
+      console.warn(`[webhook] ${eventName}: variant ${variantId} not mapped — skipping`);
+      await log('ignored', `variant ${variantId} not mapped`);
       return res.json({ ok: true, skipped: true, reason: `variant ${variantId} not mapped` });
     }
+
+    // Dedup key: subscription_created fires once per sub; renewed fires once per cycle
+    const idemKey = eventName === 'subscription_created'
+      ? `sc:${subscriptionId}`
+      : `sr:${subscriptionId}:${renewsAt}`;
+
+    if (await alreadyProcessed(idemKey)) {
+      console.log(`[webhook] ${eventName} duplicate skipped — ${idemKey}`);
+      await log('skipped', 'duplicate delivery', idemKey);
+      return res.json({ ok: true, duplicate: true });
+    }
+
     const user = await findUser('id, credits, subscription_id');
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    // Cancel previous subscription on upgrade (subscription_created only)
+    if (!user) {
+      await log('error', 'user not found');
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Cancel old subscription on plan upgrade
     if (eventName === 'subscription_created' && user.subscription_id && user.subscription_id !== subscriptionId) {
       try {
         await fetch(`https://api.lemonsqueezy.com/v1/subscriptions/${user.subscription_id}`, {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${process.env.LEMONSQUEEZY_API_KEY}`, Accept: 'application/vnd.api+json' },
         });
-        console.log(`Cancelled old subscription ${user.subscription_id} for ${userEmail}`);
+        console.log(`[webhook] Cancelled old sub ${user.subscription_id} for ${userEmail}`);
       } catch (e) {
-        console.warn(`Failed to cancel old subscription ${user.subscription_id}:`, e.message);
+        console.warn(`[webhook] Failed to cancel old sub ${user.subscription_id}:`, e.message);
       }
     }
-    await supabase.from('users').update({
-      credits: user.credits + planInfo.credits,
-      plan: planInfo.plan,
-      subscription_status: 'active',
-      subscription_id: subscriptionId,
-      renews_at: renewsAt,
-      current_period_end: renewsAt,
-    }).eq('id', user.id);
-    // Record subscription payment in history
-    await supabase.from('subscriptions').insert({
-      user_id: user.id,
-      plan: planInfo.plan,
-      credits_added: planInfo.credits,
-    });
-    console.log(`+${planInfo.credits} credits → ${userEmail}`);
+
+    const upd = {
+      credits: user.credits + planInfo.credits, plan: planInfo.plan,
+      subscription_status: 'active', subscription_id: subscriptionId,
+      renews_at: renewsAt, current_period_end: renewsAt,
+    };
+    if (userCountry) upd.country = userCountry;
+    if (userCity)    upd.city    = userCity;
+    await supabase.from('users').update(upd).eq('id', user.id);
+    await supabase.from('subscriptions').insert({ user_id: user.id, plan: planInfo.plan, credits_added: planInfo.credits });
+    await log('success', `+${planInfo.credits} credits [${planInfo.plan}]`, idemKey);
+    console.log(`[webhook] +${planInfo.credits} credits [${planInfo.plan}] → ${userEmail}`);
     return res.json({ ok: true, credits_added: planInfo.credits });
   }
+
+  // ── subscription_cancelled ────────────────────────────────────────────────
   if (eventName === 'subscription_cancelled') {
     const user = await findUser('id, subscription_id, plan, current_period_end');
-    // Accept if subscription matches OR if subscription_id was cleared (restore it)
     if (user && (user.subscription_id === subscriptionId || !user.subscription_id)) {
-      const updateData = {
-        subscription_status: 'cancelled',
-        subscription_id: subscriptionId, // always restore from webhook payload
-      };
-      if (renewsAt) updateData.current_period_end = renewsAt;
-      // Set plan: prefer webhook mapping, fall back to existing DB value (never null it out on cancel)
+      const upd = { subscription_status: 'cancelled', subscription_id: subscriptionId };
+      if (renewsAt) upd.current_period_end = renewsAt;
       const resolvedPlan = planInfo?.plan || user.plan || null;
-      if (resolvedPlan) updateData.plan = resolvedPlan;
-      await supabase.from('users').update(updateData).eq('id', user.id);
-      console.log(`Sub ${subscriptionId} cancelled for ${userEmail} — plan: ${resolvedPlan}, access until ${renewsAt}`);
+      if (resolvedPlan) upd.plan = resolvedPlan;
+      await supabase.from('users').update(upd).eq('id', user.id);
+      await log('success', `cancelled — access until ${renewsAt}`);
+      console.log(`[webhook] sub ${subscriptionId} cancelled for ${userEmail}, access until ${renewsAt}`);
     } else if (user) {
-      console.log(`Ignoring subscription_cancelled for old sub ${subscriptionId} — active: ${user.subscription_id}`);
+      await log('ignored', `sub ${subscriptionId} doesn't match active ${user.subscription_id}`);
+      console.log(`[webhook] ignoring cancel for stale sub ${subscriptionId} (active: ${user.subscription_id})`);
+    } else {
+      await log('error', 'user not found');
     }
     return res.json({ ok: true });
   }
 
+  // ── subscription_expired ──────────────────────────────────────────────────
   if (eventName === 'subscription_expired') {
     const user = await findUser('id, subscription_id');
     if (user && (user.subscription_id === subscriptionId || !user.subscription_id)) {
-      // Period ended — remove Pro privileges, preserve subscription_id for resume
-      const expiredUpdate = {
-        plan: null,
-        subscription_status: 'expired',
-        renews_at: null,
-        current_period_end: null,
-      };
-      // Only update subscription_id if webhook provides a valid non-empty value
-      if (subscriptionId) expiredUpdate.subscription_id = subscriptionId;
-      await supabase.from('users').update(expiredUpdate).eq('id', user.id);
-      console.log(`Sub ${subscriptionId} expired for ${userEmail} — plan cleared, sub_id kept`);
+      const upd = { plan: null, subscription_status: 'expired', renews_at: null, current_period_end: null };
+      if (subscriptionId) upd.subscription_id = subscriptionId;
+      await supabase.from('users').update(upd).eq('id', user.id);
+      await log('success', 'plan cleared, sub_id kept for resume');
+      console.log(`[webhook] sub ${subscriptionId} expired for ${userEmail}`);
     } else if (user) {
-      console.log(`Ignoring subscription_expired for old sub ${subscriptionId} — active: ${user.subscription_id}`);
+      await log('ignored', `sub ${subscriptionId} doesn't match active ${user.subscription_id}`);
+    } else {
+      await log('error', 'user not found');
     }
     return res.json({ ok: true });
   }
-  // ===== ONE-TIME ORDER (credit packs + pack purchases) =====
+
+  // ── subscription_payment_failed ───────────────────────────────────────────
+  if (eventName === 'subscription_payment_failed') {
+    const user = await findUser('id, subscription_id, plan');
+    if (user) {
+      if (!user.subscription_id || user.subscription_id === subscriptionId) {
+        await supabase.from('users')
+          .update({ subscription_status: 'past_due', subscription_id: subscriptionId })
+          .eq('id', user.id);
+        await log('success', 'status set to past_due');
+        console.log(`[webhook] past_due → ${userEmail} (sub: ${subscriptionId})`);
+      } else {
+        await log('ignored', `sub ${subscriptionId} doesn't match active ${user.subscription_id}`);
+        console.log(`[webhook] ignoring payment_failed for stale sub ${subscriptionId}`);
+      }
+    } else {
+      await log('error', 'user not found');
+      console.warn(`[webhook] payment_failed: user not found for ${userEmail}`);
+    }
+    return res.json({ ok: true });
+  }
+
+  // ── subscription_resumed ──────────────────────────────────────────────────
+  if (eventName === 'subscription_resumed') {
+    const user = await findUser('id, subscription_id, plan');
+    if (user) {
+      const resumePlan = planInfo?.plan || user.plan || null;
+      const upd = { subscription_status: 'active' };
+      if (subscriptionId) upd.subscription_id = subscriptionId;
+      if (renewsAt) { upd.renews_at = renewsAt; upd.current_period_end = renewsAt; }
+      if (resumePlan) upd.plan = resumePlan;
+      if (userCountry) upd.country = userCountry;
+      if (userCity)    upd.city    = userCity;
+      await supabase.from('users').update(upd).eq('id', user.id);
+      await log('success', `resumed — plan: ${resumePlan}`);
+      console.log(`[webhook] sub ${subscriptionId} resumed for ${userEmail}`);
+    } else {
+      await log('error', 'user not found');
+    }
+    return res.json({ ok: true });
+  }
+
+  // ── subscription_updated: plan changes, pauses, date syncs ───────────────
+  if (eventName === 'subscription_updated') {
+    const lsStatus = attrs?.status;
+    if (lsStatus === 'active' || lsStatus === 'on_trial') {
+      const user = await findUser('id, subscription_status, plan');
+      if (user) {
+        const resumePlan = planInfo?.plan || user.plan || null;
+        const upd = { subscription_status: 'active', subscription_id: subscriptionId };
+        if (renewsAt)    { upd.renews_at = renewsAt; upd.current_period_end = renewsAt; }
+        if (resumePlan)    upd.plan    = resumePlan;
+        if (userCountry)   upd.country = userCountry;
+        if (userCity)      upd.city    = userCity;
+        await supabase.from('users').update(upd).eq('id', user.id);
+        await log('success', `synced active — plan: ${resumePlan}`);
+        console.log(`[webhook] subscription_updated → active for ${userEmail}, plan: ${resumePlan}`);
+      } else {
+        await log('error', 'user not found');
+      }
+    } else if (lsStatus === 'cancelled') {
+      const user = await findUser('id, subscription_id');
+      if (user && user.subscription_id === subscriptionId) {
+        const upd = { subscription_status: 'cancelled' };
+        if (renewsAt) upd.current_period_end = renewsAt;
+        await supabase.from('users').update(upd).eq('id', user.id);
+        await log('success', 'cancel synced via subscription_updated');
+        console.log(`[webhook] subscription_updated → cancel synced for ${userEmail}`);
+      } else {
+        await log('ignored', `lsStatus=cancelled but sub mismatch or no user`);
+      }
+    } else {
+      await log('ignored', `unhandled lsStatus: ${lsStatus}`);
+    }
+    return res.json({ ok: true });
+  }
+
+  // ── order_created: credit packs + pack purchases ──────────────────────────
   if (eventName === 'order_created') {
-    const orderAttrs = payload.data?.attributes;
-    const orderEmail = orderAttrs?.user_email;
-    const orderItems = orderAttrs?.first_order_item || {};
+    const orderEmail     = attrs?.user_email;
+    const orderItems     = attrs?.first_order_item || {};
     const orderVariantId = String(orderItems?.variant_id || '');
-    const orderId = String(payload.data?.id || '');
+    const orderId        = String(payload.data?.id || '');
+    const orderCountry   = attrs?.user_country ?? null;
+    const orderCity      = attrs?.billing_address?.city ?? null;
 
-    console.log(`Order: ${orderId} | ${orderEmail} | variant: ${orderVariantId}`);
+    console.log(`[webhook] order_created: ${orderId} | ${orderEmail} | variant: ${orderVariantId}`);
 
-    // ── Credit pack purchase ──
     const creditAmount = CREDIT_PACK_VARIANTS[orderVariantId];
     if (creditAmount) {
+      // Idempotency: check credit_transactions for duplicate order
+      const { data: dupTx } = await supabase.from('credit_transactions')
+        .select('id').eq('ls_order_id', orderId).maybeSingle();
+      if (dupTx) {
+        console.log(`[webhook] duplicate credit order ${orderId} — skipping`);
+        await log('skipped', `duplicate order_id ${orderId}`, `oc:${orderId}`);
+        return res.json({ ok: true, duplicate: true });
+      }
+
       const user = await findUser('id, credits');
       if (!user) {
-        console.log('User not found for credit pack purchase:', orderEmail, '| custom_user_id:', customUserId);
+        await log('error', `user not found for credit pack — email: ${orderEmail}`);
         return res.status(404).json({ error: 'User not found' });
       }
-      await supabase.from('users').update({ credits: user.credits + creditAmount }).eq('id', user.id);
+
+      const upd = { credits: user.credits + creditAmount };
+      if (orderCountry) upd.country = orderCountry;
+      if (orderCity)    upd.city    = orderCity;
+      await supabase.from('users').update(upd).eq('id', user.id);
       const { error: txErr } = await supabase.from('credit_transactions').insert({
-        user_id: user.id,
-        credits_added: creditAmount,
-        source: 'purchase',
-        ls_order_id: orderId,
+        user_id: user.id, credits_added: creditAmount, source: 'purchase', ls_order_id: orderId,
       });
-      if (txErr) console.error('credit_transactions insert error:', txErr.message, txErr.details);
-      console.log(`+${creditAmount} credits (purchase) → ${orderEmail} (user: ${user.id})`);
+      if (txErr) console.error('[webhook] credit_transactions insert error:', txErr.message);
+      await log('success', `+${creditAmount} credits (purchase)`, `oc:${orderId}`);
+      console.log(`[webhook] +${creditAmount} credits (purchase) → ${orderEmail}`);
       return res.json({ ok: true, credits_added: creditAmount });
     }
 
-    // ── Pack purchase ──
-    const { data: packProduct } = await supabase
-      .from('pack_products')
-      .select('pack_name, bonus_credits')
-      .eq('ls_variant_id', orderVariantId)
-      .single();
+    // Pack purchase
+    const { data: packProduct } = await supabase.from('pack_products')
+      .select('pack_name, bonus_credits').eq('ls_variant_id', orderVariantId).single();
 
     if (!packProduct) {
-      console.log('No product found for variant:', orderVariantId);
+      await log('ignored', `no product for variant ${orderVariantId}`);
+      console.log(`[webhook] no product for variant: ${orderVariantId}`);
       return res.json({ ok: true, skipped: true });
     }
 
     const user = await findUser('id, credits');
     if (!user) {
-      console.log('User not found for pack purchase:', orderEmail, '| custom_user_id:', customUserId);
+      await log('error', `user not found for pack — email: ${orderEmail}`);
       return res.status(404).json({ error: 'User not found' });
     }
 
-    await supabase.from('user_packs').upsert({
-      user_id: user.id,
-      pack_name: packProduct.pack_name,
-      ls_order_id: orderId,
-    }, { onConflict: 'user_id,pack_name' });
-
-    if (packProduct.bonus_credits > 0) {
-      await supabase.from('users').update({ credits: user.credits + packProduct.bonus_credits }).eq('id', user.id);
-    }
-
-    console.log(`Pack "${packProduct.pack_name}" granted to ${orderEmail} + ${packProduct.bonus_credits} bonus credits`);
+    // upsert is idempotent on (user_id, pack_name)
+    await supabase.from('user_packs').upsert(
+      { user_id: user.id, pack_name: packProduct.pack_name, ls_order_id: orderId },
+      { onConflict: 'user_id,pack_name' },
+    );
+    const packUpd = {};
+    if (orderCountry) packUpd.country = orderCountry;
+    if (orderCity)    packUpd.city    = orderCity;
+    if (packProduct.bonus_credits > 0) packUpd.credits = user.credits + packProduct.bonus_credits;
+    if (Object.keys(packUpd).length > 0) await supabase.from('users').update(packUpd).eq('id', user.id);
+    await log('success', `pack "${packProduct.pack_name}" +${packProduct.bonus_credits} bonus credits`);
+    console.log(`[webhook] pack "${packProduct.pack_name}" → ${orderEmail} +${packProduct.bonus_credits} bonus`);
     return res.json({ ok: true, pack: packProduct.pack_name, bonus_credits: packProduct.bonus_credits });
   }
 
-  if (eventName === 'subscription_resumed') {
-    const user = await findUser('id, subscription_id, plan');
-    if (user) {
-      // Prefer webhook plan, fall back to existing DB plan (never null it out on resume)
-      const resumePlan = planInfo?.plan || user.plan || null;
-      const updateData = { subscription_status: 'active' };
-      // Only set subscription_id if webhook provides a non-empty value
-      if (subscriptionId) updateData.subscription_id = subscriptionId;
-      // Only set renews_at / current_period_end if webhook provides a value
-      if (renewsAt) { updateData.renews_at = renewsAt; updateData.current_period_end = renewsAt; }
-      if (resumePlan) updateData.plan = resumePlan;
-      await supabase.from('users').update(updateData).eq('id', user.id);
-      console.log(`Sub ${subscriptionId} resumed for ${userEmail} — plan: ${resumePlan}, renews: ${renewsAt}`);
-    }
-    return res.json({ ok: true });
-  }
-
-  // subscription_updated fires for plan changes, resumes, pauses, etc.
-  if (eventName === 'subscription_updated') {
-    const lsStatus = attrs?.status;
-    console.log(`subscription_updated for ${userEmail} — LS status: ${lsStatus}, sub: ${subscriptionId}`);
-
-    if (lsStatus === 'active' || lsStatus === 'on_trial') {
-      // Always sync on active — covers resume, plan change, billing date update
-      const user = await findUser('id, subscription_status, plan');
-      if (user) {
-        // Prefer webhook plan mapping, fall back to existing DB plan (never null it out)
-        const resumePlan = planInfo?.plan || user.plan || null;
-        const updateData = {
-          subscription_status: 'active',
-          subscription_id: subscriptionId,
-        };
-        // Only update renews_at/current_period_end if webhook provides a value — avoid nulling them out
-        if (renewsAt) { updateData.renews_at = renewsAt; updateData.current_period_end = renewsAt; }
-        if (resumePlan) updateData.plan = resumePlan;
-        await supabase.from('users').update(updateData).eq('id', user.id);
-        console.log(`subscription_updated → synced active for ${userEmail}, plan: ${resumePlan}, renews: ${renewsAt}`);
-      }
-    } else if (lsStatus === 'cancelled') {
-      // Also handle cancel via subscription_updated (some LS versions send this instead of subscription_cancelled)
-      const user = await findUser('id, subscription_id');
-      if (user && user.subscription_id === subscriptionId) {
-        const updateData = { subscription_status: 'cancelled' };
-        if (renewsAt) updateData.current_period_end = renewsAt;
-        await supabase.from('users').update(updateData).eq('id', user.id);
-        console.log(`subscription_updated → cancel synced for ${userEmail}`);
-      }
-    }
-    return res.json({ ok: true });
-  }
-
-  console.log(`Unhandled webhook event: ${eventName}`);
-  res.json({ ok: true, skipped: true });
+  // ── Unhandled event ───────────────────────────────────────────────────────
+  await log('ignored', 'unhandled event type');
+  console.log(`[webhook] unhandled event: ${eventName}`);
+  return res.json({ ok: true, skipped: true });
 });
 
 // ===== ENSURE USER =====
@@ -415,7 +530,7 @@ app.get('/api/profile', async (req, res) => {
   if (!authUser) return res.status(401).json({ error: 'Unauthorized' });
   const { data } = await supabase
     .from('users')
-    .select('credits, plan, subscription_status, subscription_id, current_period_end, renews_at, email, nickname, avatar_url, bio, website')
+    .select('credits, plan, subscription_status, subscription_id, current_period_end, renews_at, email, nickname, avatar_url, bio, website, country, city')
     .eq('id', authUser.id)
     .single();
   if (!data) return res.status(404).json({ error: 'User not found' });
@@ -807,8 +922,18 @@ app.post('/api/create-checkout', async (req, res) => {
   const storeId = process.env.LS_STORE_ID;
   if (!apiKey || !storeId) return res.status(500).json({ error: 'LS not configured' });
 
-  const { data: user } = await supabase.from('users').select('email').eq('id', authUser.id).single();
+  const { data: user } = await supabase.from('users')
+    .select('email, subscription_status, plan')
+    .eq('id', authUser.id).single();
   if (!user) return res.status(404).json({ error: 'User not found' });
+
+  // Block double-purchase: active subscribers cannot start a new checkout
+  if (user.subscription_status === 'active') {
+    return res.status(409).json({
+      error: 'You already have an active plan',
+      plan: user.plan,
+    });
+  }
 
   try {
     const lsRes = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
@@ -1730,7 +1855,7 @@ app.post('/api/collections/:slug/download', async (req, res) => {
 });
 
 // ===== HEALTH CHECK =====
-app.get('/', (req, res) => res.json({ status: 'ok', version: '4.0', note: 'server-side pagination' }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '4.1', features: ['webhook_logs', 'idempotency', 'past_due'] }));
 
 // ═══════════════════════════════════════════
 // ADMIN API — protected by X-Admin-Key header
